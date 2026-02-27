@@ -20,6 +20,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <errno.h>
 
 #define MAX_TARGETS  512
 #define MAX_LABEL    4
@@ -30,23 +34,30 @@
  * differ if you change monitor config or scale. */
 #define YDOTOOL_RATIO 2.375
 
-static const AtspiRole CLICKABLE_ROLES[] = {
-    ATSPI_ROLE_PUSH_BUTTON,  ATSPI_ROLE_TOGGLE_BUTTON,
-    ATSPI_ROLE_CHECK_BOX,    ATSPI_ROLE_RADIO_BUTTON,
-    ATSPI_ROLE_MENU_ITEM,    ATSPI_ROLE_LINK,
-    ATSPI_ROLE_PAGE_TAB,     ATSPI_ROLE_COMBO_BOX,
-    ATSPI_ROLE_ENTRY,        ATSPI_ROLE_SPIN_BUTTON,
-    ATSPI_ROLE_SLIDER,       ATSPI_ROLE_ICON,
-    ATSPI_ROLE_LIST_ITEM,    ATSPI_ROLE_TABLE_CELL,
-    ATSPI_ROLE_TREE_ITEM,    ATSPI_ROLE_TOOL_BAR,
-    ATSPI_ROLE_TEXT,          ATSPI_ROLE_DOCUMENT_WEB,
-};
-#define N_CLICKABLE (sizeof(CLICKABLE_ROLES) / sizeof(CLICKABLE_ROLES[0]))
+/* lookup table for clickable roles — indexed by role enum value.
+ * much faster than linear scan on every node. */
+static gboolean clickable_lut[256];
+
+static void init_clickable_lut(void) {
+    static const AtspiRole roles[] = {
+        ATSPI_ROLE_PUSH_BUTTON,  ATSPI_ROLE_TOGGLE_BUTTON,
+        ATSPI_ROLE_CHECK_BOX,    ATSPI_ROLE_RADIO_BUTTON,
+        ATSPI_ROLE_MENU_ITEM,    ATSPI_ROLE_LINK,
+        ATSPI_ROLE_PAGE_TAB,     ATSPI_ROLE_COMBO_BOX,
+        ATSPI_ROLE_ENTRY,        ATSPI_ROLE_SPIN_BUTTON,
+        ATSPI_ROLE_SLIDER,       ATSPI_ROLE_ICON,
+        ATSPI_ROLE_LIST_ITEM,    ATSPI_ROLE_TABLE_CELL,
+        ATSPI_ROLE_TREE_ITEM,    ATSPI_ROLE_TOOL_BAR,
+        ATSPI_ROLE_TEXT,          ATSPI_ROLE_DOCUMENT_WEB,
+    };
+    memset(clickable_lut, 0, sizeof(clickable_lut));
+    for (size_t i = 0; i < sizeof(roles)/sizeof(roles[0]); i++)
+        if ((int)roles[i] < 256) clickable_lut[(int)roles[i]] = TRUE;
+}
 
 typedef struct {
     int x, y, w, h;
     char label[MAX_LABEL + 1];
-    char name[128];
 } Target;
 
 typedef struct {
@@ -63,32 +74,64 @@ typedef struct {
 } State;
 
 /* ------------------------------------------------------------------ */
-/*  helpers                                                            */
+/*  hyprctl — direct socket, no popen/shell overhead                   */
 /* ------------------------------------------------------------------ */
 
-static gboolean is_clickable(AtspiRole role) {
-    for (size_t i = 0; i < N_CLICKABLE; i++)
-        if (CLICKABLE_ROLES[i] == role) return TRUE;
-    return FALSE;
-}
+/* talk to hyprland's unix socket directly instead of spawning
+ * "hyprctl" as a subprocess. way faster. */
+static char *hyprctl_request(const char *request) {
+    const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    if (!his) return NULL;
 
-static char *run_cmd(const char *cmd) {
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return NULL;
-    size_t cap = 4096, len = 0;
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/hypr/%s/.socket.sock", his);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return NULL;
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        /* try XDG_RUNTIME_DIR path */
+        const char *xrd = getenv("XDG_RUNTIME_DIR");
+        if (xrd) {
+            snprintf(path, sizeof(path), "%s/hypr/%s/.socket.sock", xrd, his);
+            strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+            if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+                close(fd);
+                return NULL;
+            }
+        } else {
+            close(fd);
+            return NULL;
+        }
+    }
+
+    /* send request */
+    size_t rlen = strlen(request);
+    if (write(fd, request, rlen) != (ssize_t)rlen) {
+        close(fd);
+        return NULL;
+    }
+
+    /* read response */
+    size_t cap = 8192, len = 0;
     char *buf = malloc(cap);
     while (1) {
-        size_t n = fread(buf + len, 1, cap - len - 1, fp);
-        if (n == 0) break;
+        ssize_t n = read(fd, buf + len, cap - len - 1);
+        if (n <= 0) break;
         len += n;
         if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
     }
     buf[len] = '\0';
-    pclose(fp);
+    close(fd);
     return buf;
 }
 
-/* dumb json helpers — good enough for hyprctl output */
+/* ------------------------------------------------------------------ */
+/*  json helpers                                                       */
+/* ------------------------------------------------------------------ */
 
 static int json_int(const char *j, const char *key, int def) {
     char pat[128];
@@ -172,11 +215,11 @@ static void walk(AtspiAccessible *node, Target *out, int *n, int depth) {
             gboolean ok = atspi_state_set_contains(ss, ATSPI_STATE_VISIBLE)
                        && atspi_state_set_contains(ss, ATSPI_STATE_SHOWING);
             g_object_unref(ss);
-            if (!ok) goto kids;
+            if (!ok) return; /* prune: don't descend into invisible subtrees */
         }
     }
 
-    if (is_clickable(role)) {
+    if ((int)role < 256 && clickable_lut[(int)role]) {
         AtspiComponent *comp = atspi_accessible_get_component_iface(node);
         if (comp) {
             AtspiRect *ext = atspi_component_get_extents(
@@ -185,14 +228,6 @@ static void walk(AtspiAccessible *node, Target *out, int *n, int depth) {
                 Target *t = &out[*n];
                 t->x = ext->x; t->y = ext->y;
                 t->w = ext->width; t->h = ext->height;
-                gchar *name = atspi_accessible_get_name(node, NULL);
-                if (name) {
-                    strncpy(t->name, name, sizeof(t->name) - 1);
-                    t->name[sizeof(t->name) - 1] = '\0';
-                    g_free(name);
-                } else {
-                    t->name[0] = '\0';
-                }
                 (*n)++;
             }
             if (ext) g_free(ext);
@@ -209,15 +244,13 @@ kids:;
     }
 }
 
-static AtspiAccessible *find_active_window(void) {
-    char *j = run_cmd("hyprctl -j activewindow");
+static AtspiAccessible *find_active_window(const char *aw_json) {
     char wclass[128] = {0};
     int wpid = 0;
-    if (j) {
-        json_str(j, "class", wclass, sizeof(wclass));
-        wpid = json_int(j, "pid", 0);
+    if (aw_json) {
+        json_str(aw_json, "class", wclass, sizeof(wclass));
+        wpid = json_int(aw_json, "pid", 0);
         for (char *p = wclass; *p; p++) *p = g_ascii_tolower(*p);
-        free(j);
     }
 
     AtspiAccessible *desktop = atspi_get_desktop(0);
@@ -287,13 +320,11 @@ static gboolean coords_ok(Target *t, int n) {
     return (double)z / n < 0.8;
 }
 
-static void grid_fallback(Target *t, int n) {
+static void grid_fallback(Target *t, int n, const char *aw_json) {
     int wx = 100, wy = 100, ww = 800, wh = 600;
-    char *j = run_cmd("hyprctl -j activewindow");
-    if (j) {
-        json_int_pair(j, "at", &wx, &wy);
-        json_int_pair(j, "size", &ww, &wh);
-        free(j);
+    if (aw_json) {
+        json_int_pair(aw_json, "at", &wx, &wy);
+        json_int_pair(aw_json, "size", &ww, &wh);
     }
     int m = 30;
     wx += m; wy += m; ww -= m*2; wh -= m*2;
@@ -308,17 +339,34 @@ static void grid_fallback(Target *t, int n) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  ydotool                                                            */
+/*  ydotool — direct exec, no shell                                    */
 /* ------------------------------------------------------------------ */
 
 static void do_click(int x, int y) {
     int yx = (int)round((double)x / YDOTOOL_RATIO);
     int yy = (int)round((double)y / YDOTOOL_RATIO);
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-        "YDOTOOL_SOCKET=/tmp/.ydotool_socket ydotool mousemove -a -x %d -y %d && "
-        "YDOTOOL_SOCKET=/tmp/.ydotool_socket ydotool click 0xC0", yx, yy);
-    system(cmd);
+
+    char sx[16], sy[16];
+    snprintf(sx, sizeof(sx), "%d", yx);
+    snprintf(sy, sizeof(sy), "%d", yy);
+
+    /* move */
+    pid_t pid = fork();
+    if (pid == 0) {
+        setenv("YDOTOOL_SOCKET", "/tmp/.ydotool_socket", 1);
+        execlp("ydotool", "ydotool", "mousemove", "-a", "-x", sx, "-y", sy, NULL);
+        _exit(1);
+    }
+    if (pid > 0) waitpid(pid, NULL, 0);
+
+    /* click */
+    pid = fork();
+    if (pid == 0) {
+        setenv("YDOTOOL_SOCKET", "/tmp/.ydotool_socket", 1);
+        execlp("ydotool", "ydotool", "click", "0xC0", NULL);
+        _exit(1);
+    }
+    if (pid > 0) waitpid(pid, NULL, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -453,10 +501,15 @@ static void on_shutdown(GtkApplication *app, gpointer data) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[]) {
+    init_clickable_lut();
     atspi_init();
 
-    AtspiAccessible *win = find_active_window();
+    /* single hyprctl call — reuse for both window finding and coord fixup */
+    char *aw_json = hyprctl_request("j/activewindow");
+
+    AtspiAccessible *win = find_active_window(aw_json);
     if (!win) {
+        free(aw_json);
         system("notify-send -t 3000 wlim 'no accessible elements — app may not support at-spi'");
         return 1;
     }
@@ -466,6 +519,7 @@ int main(int argc, char *argv[]) {
     g_object_unref(win);
 
     if (st.n_targets == 0) {
+        free(aw_json);
         system("notify-send -t 3000 wlim 'no clickable elements found'");
         return 1;
     }
@@ -476,8 +530,9 @@ int main(int argc, char *argv[]) {
             st.targets[i].y += st.targets[i].h / 2;
         }
     } else {
-        grid_fallback(st.targets, st.n_targets);
+        grid_fallback(st.targets, st.n_targets, aw_json);
     }
+    free(aw_json);
 
     generate_labels(st.targets, st.n_targets);
 
