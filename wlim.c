@@ -1,7 +1,7 @@
 /*
  * wlim — vimium-like click hints for wayland (hyprland)
  *
- * walks the AT-SPI2 accessibility tree of the focused window,
+ * walks the AT-SPI2 accessibility tree of all visible windows,
  * draws labeled hints over every clickable element using a
  * GTK4 + gtk4-layer-shell overlay, and clicks via ydotool
  * when you type a hint.
@@ -25,7 +25,7 @@
 #include <sys/wait.h>
 #include <errno.h>
 
-#define MAX_TARGETS  512
+#define MAX_TARGETS  1024
 #define MAX_LABEL    4
 #define MAX_TYPED    8
 
@@ -34,8 +34,7 @@
  * differ if you change monitor config or scale. */
 #define YDOTOOL_RATIO 2.375
 
-/* lookup table for clickable roles — indexed by role enum value.
- * much faster than linear scan on every node. */
+/* lookup table for clickable roles */
 static gboolean clickable_lut[256];
 
 static void init_clickable_lut(void) {
@@ -74,11 +73,9 @@ typedef struct {
 } State;
 
 /* ------------------------------------------------------------------ */
-/*  hyprctl — direct socket, no popen/shell overhead                   */
+/*  hyprctl — direct socket                                            */
 /* ------------------------------------------------------------------ */
 
-/* talk to hyprland's unix socket directly instead of spawning
- * "hyprctl" as a subprocess. way faster. */
 static char *hyprctl_request(const char *request) {
     const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
     if (!his) return NULL;
@@ -93,7 +90,6 @@ static char *hyprctl_request(const char *request) {
     strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        /* try XDG_RUNTIME_DIR path */
         const char *xrd = getenv("XDG_RUNTIME_DIR");
         if (xrd) {
             snprintf(path, sizeof(path), "%s/hypr/%s/.socket.sock", xrd, his);
@@ -108,14 +104,12 @@ static char *hyprctl_request(const char *request) {
         }
     }
 
-    /* send request */
     size_t rlen = strlen(request);
     if (write(fd, request, rlen) != (ssize_t)rlen) {
         close(fd);
         return NULL;
     }
 
-    /* read response */
     size_t cap = 8192, len = 0;
     char *buf = malloc(cap);
     while (1) {
@@ -174,6 +168,78 @@ static void json_int_pair(const char *j, const char *key, int *a, int *b) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  hyprctl client geometry lookup                                     */
+/* ------------------------------------------------------------------ */
+
+/* find the geometry of a hyprland client by matching its pid against
+ * the clients json array. returns false if not found. */
+static gboolean find_client_geom(const char *clients_json, int pid,
+                                  int *cx, int *cy, int *cw, int *ch)
+{
+    if (!clients_json || pid <= 0) return FALSE;
+
+    /* scan through the json array looking for objects with matching pid.
+     * we look for each '{' block and check the pid inside it. */
+    const char *p = clients_json;
+    while ((p = strchr(p, '{')) != NULL) {
+        /* find the end of this object */
+        const char *end = strchr(p, '}');
+        if (!end) break;
+
+        /* extract pid from this object block */
+        size_t blen = end - p + 1;
+        char *block = malloc(blen + 1);
+        memcpy(block, p, blen);
+        block[blen] = '\0';
+
+        int cpid = json_int(block, "pid", -1);
+        if (cpid == pid) {
+            json_int_pair(block, "at", cx, cy);
+            json_int_pair(block, "size", cw, ch);
+            free(block);
+            return TRUE;
+        }
+        free(block);
+        p = end + 1;
+    }
+    return FALSE;
+}
+
+/* find client geometry by matching AT-SPI window title against
+ * hyprctl client titles */
+static gboolean find_client_geom_by_title(const char *clients_json,
+                                            const char *title,
+                                            int *cx, int *cy, int *cw, int *ch)
+{
+    if (!clients_json || !title || !title[0]) return FALSE;
+
+    const char *p = clients_json;
+    while ((p = strchr(p, '{')) != NULL) {
+        const char *end = strchr(p, '}');
+        if (!end) break;
+
+        size_t blen = end - p + 1;
+        char *block = malloc(blen + 1);
+        memcpy(block, p, blen);
+        block[blen] = '\0';
+
+        char ctitle[256];
+        json_str(block, "title", ctitle, sizeof(ctitle));
+
+        /* partial match — at-spi titles are often truncated */
+        if (ctitle[0] && (strstr(ctitle, title) || strstr(title, ctitle))) {
+            json_int_pair(block, "at", cx, cy);
+            json_int_pair(block, "size", cw, ch);
+            free(block);
+            return TRUE;
+        }
+        free(block);
+        p = end + 1;
+    }
+    return FALSE;
+}
+
+/* ------------------------------------------------------------------ */
 /*  label generation                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -208,14 +274,13 @@ static void walk(AtspiAccessible *node, Target *out, int *n, int depth) {
     AtspiRole role = atspi_accessible_get_role(node, &err);
     if (err) { g_error_free(err); goto kids; }
 
-    /* skip invisible stuff (but always descend into root) */
     if (depth > 0) {
         AtspiStateSet *ss = atspi_accessible_get_state_set(node);
         if (ss) {
             gboolean ok = atspi_state_set_contains(ss, ATSPI_STATE_VISIBLE)
                        && atspi_state_set_contains(ss, ATSPI_STATE_SHOWING);
             g_object_unref(ss);
-            if (!ok) return; /* prune: don't descend into invisible subtrees */
+            if (!ok) return;
         }
     }
 
@@ -244,97 +309,79 @@ kids:;
     }
 }
 
-static AtspiAccessible *find_active_window(const char *aw_json) {
-    char wclass[128] = {0};
-    int wpid = 0;
-    if (aw_json) {
-        json_str(aw_json, "class", wclass, sizeof(wclass));
-        wpid = json_int(aw_json, "pid", 0);
-        for (char *p = wclass; *p; p++) *p = g_ascii_tolower(*p);
-    }
-
+/* walk all AT-SPI apps/windows, collecting targets from every one.
+ * for windows with broken coords (GTK4), use grid_fallback per window. */
+static void collect_all_targets(State *st, const char *clients_json) {
     AtspiAccessible *desktop = atspi_get_desktop(0);
     int napps = atspi_accessible_get_child_count(desktop, NULL);
 
-    /* try ACTIVE state first */
-    for (int i = 0; i < napps; i++) {
+    for (int i = 0; i < napps && st->n_targets < MAX_TARGETS; i++) {
         AtspiAccessible *app = atspi_accessible_get_child_at_index(desktop, i, NULL);
         if (!app) continue;
-        int nw = atspi_accessible_get_child_count(app, NULL);
-        for (int k = 0; k < nw; k++) {
+
+        int nwins = atspi_accessible_get_child_count(app, NULL);
+        guint app_pid = atspi_accessible_get_process_id(app, NULL);
+
+        for (int k = 0; k < nwins && st->n_targets < MAX_TARGETS; k++) {
             AtspiAccessible *w = atspi_accessible_get_child_at_index(app, k, NULL);
             if (!w) continue;
-            AtspiStateSet *ss = atspi_accessible_get_state_set(w);
-            if (ss && atspi_state_set_contains(ss, ATSPI_STATE_ACTIVE)) {
-                g_object_unref(ss); g_object_unref(app);
-                return w;
+
+            /* remember where this window's targets start */
+            int start = st->n_targets;
+
+            walk(w, st->targets, &st->n_targets, 0);
+
+            int count = st->n_targets - start;
+            if (count > 0) {
+                /* check if this window's coords are usable */
+                int zeros = 0;
+                for (int t = start; t < st->n_targets; t++)
+                    if (st->targets[t].x == 0 && st->targets[t].y == 0) zeros++;
+
+                if ((double)zeros / count >= 0.8) {
+                    /* broken coords — try to find this window's geometry
+                     * from hyprctl and distribute in a grid */
+                    int wx = 0, wy = 0, ww = 0, wh = 0;
+                    gboolean found = find_client_geom(clients_json,
+                                                       (int)app_pid,
+                                                       &wx, &wy, &ww, &wh);
+                    if (!found) {
+                        /* try matching by window title */
+                        gchar *wtitle = atspi_accessible_get_name(w, NULL);
+                        if (wtitle) {
+                            found = find_client_geom_by_title(clients_json,
+                                        wtitle, &wx, &wy, &ww, &wh);
+                            g_free(wtitle);
+                        }
+                    }
+                    if (found && ww > 0 && wh > 0) {
+                        int m = 30;
+                        int gx = wx + m, gy = wy + m;
+                        int gw = ww - m*2, gh = wh - m*2;
+                        int cols = (int)ceil(sqrt((double)count));
+                        int rows = (int)ceil((double)count / cols);
+                        double cw = (double)gw / (cols ? cols : 1);
+                        double ch = (double)gh / (rows ? rows : 1);
+                        for (int t = 0; t < count; t++) {
+                            st->targets[start + t].x = (int)(gx + (t % cols) * cw + cw / 2);
+                            st->targets[start + t].y = (int)(gy + (t / cols) * ch + ch / 2);
+                        }
+                    } else {
+                        /* can't find window geom — drop these targets */
+                        st->n_targets = start;
+                    }
+                } else {
+                    /* good coords — center them */
+                    for (int t = start; t < st->n_targets; t++) {
+                        st->targets[t].x += st->targets[t].w / 2;
+                        st->targets[t].y += st->targets[t].h / 2;
+                    }
+                }
             }
-            if (ss) g_object_unref(ss);
+
             g_object_unref(w);
         }
         g_object_unref(app);
-    }
-
-    /* fallback: match pid or class name */
-    for (int i = 0; i < napps; i++) {
-        AtspiAccessible *app = atspi_accessible_get_child_at_index(desktop, i, NULL);
-        if (!app) continue;
-        gchar *aname = atspi_accessible_get_name(app, NULL);
-        char lower[128] = {0};
-        if (aname) {
-            strncpy(lower, aname, sizeof(lower) - 1);
-            for (char *p = lower; *p; p++) *p = g_ascii_tolower(*p);
-            g_free(aname);
-        }
-        if (wpid > 0) {
-            guint pid = atspi_accessible_get_process_id(app, NULL);
-            if ((int)pid == wpid) {
-                int nw = atspi_accessible_get_child_count(app, NULL);
-                for (int k = 0; k < nw; k++) {
-                    AtspiAccessible *w = atspi_accessible_get_child_at_index(app, k, NULL);
-                    if (w) { g_object_unref(app); return w; }
-                }
-            }
-        }
-        if (wclass[0] && (strstr(lower, wclass) || strstr(wclass, lower))) {
-            int nw = atspi_accessible_get_child_count(app, NULL);
-            for (int k = 0; k < nw; k++) {
-                AtspiAccessible *w = atspi_accessible_get_child_at_index(app, k, NULL);
-                if (w) { g_object_unref(app); return w; }
-            }
-        }
-        g_object_unref(app);
-    }
-    return NULL;
-}
-
-/* ------------------------------------------------------------------ */
-/*  coordinate fixup                                                   */
-/* ------------------------------------------------------------------ */
-
-static gboolean coords_ok(Target *t, int n) {
-    if (n == 0) return FALSE;
-    int z = 0;
-    for (int i = 0; i < n; i++)
-        if (t[i].x == 0 && t[i].y == 0) z++;
-    return (double)z / n < 0.8;
-}
-
-static void grid_fallback(Target *t, int n, const char *aw_json) {
-    int wx = 100, wy = 100, ww = 800, wh = 600;
-    if (aw_json) {
-        json_int_pair(aw_json, "at", &wx, &wy);
-        json_int_pair(aw_json, "size", &ww, &wh);
-    }
-    int m = 30;
-    wx += m; wy += m; ww -= m*2; wh -= m*2;
-    int cols = (int)ceil(sqrt((double)n));
-    int rows = (int)ceil((double)n / cols);
-    double cw = (double)ww / (cols ? cols : 1);
-    double ch = (double)wh / (rows ? rows : 1);
-    for (int i = 0; i < n; i++) {
-        t[i].x = (int)(wx + (i % cols) * cw + cw / 2);
-        t[i].y = (int)(wy + (i / cols) * ch + ch / 2);
     }
 }
 
@@ -350,7 +397,6 @@ static void do_click(int x, int y) {
     snprintf(sx, sizeof(sx), "%d", yx);
     snprintf(sy, sizeof(sy), "%d", yy);
 
-    /* move */
     pid_t pid = fork();
     if (pid == 0) {
         setenv("YDOTOOL_SOCKET", "/tmp/.ydotool_socket", 1);
@@ -359,7 +405,6 @@ static void do_click(int x, int y) {
     }
     if (pid > 0) waitpid(pid, NULL, 0);
 
-    /* click */
     pid = fork();
     if (pid == 0) {
         setenv("YDOTOOL_SOCKET", "/tmp/.ydotool_socket", 1);
@@ -416,7 +461,6 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
     s->typed[s->typed_len] = '\0';
     update_hints(s);
 
-    /* exact match → click */
     int mi = -1, mc = 0;
     for (int i = 0; i < s->n_targets; i++)
         if (strcmp(s->targets[i].label, s->typed) == 0) { mi = i; mc++; }
@@ -428,7 +472,6 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         return TRUE;
     }
 
-    /* nothing possible → reset */
     int any = 0;
     for (int i = 0; i < s->n_targets; i++)
         if (strncmp(s->targets[i].label, s->typed, s->typed_len) == 0) any++;
@@ -504,35 +547,17 @@ int main(int argc, char *argv[]) {
     init_clickable_lut();
     atspi_init();
 
-    /* single hyprctl call — reuse for both window finding and coord fixup */
-    char *aw_json = hyprctl_request("j/activewindow");
-
-    AtspiAccessible *win = find_active_window(aw_json);
-    if (!win) {
-        free(aw_json);
-        system("notify-send -t 3000 wlim 'no accessible elements — app may not support at-spi'");
-        return 1;
-    }
+    /* fetch all hyprland client geometries in one call */
+    char *clients_json = hyprctl_request("j/clients");
 
     State st = {0};
-    walk(win, st.targets, &st.n_targets, 0);
-    g_object_unref(win);
+    collect_all_targets(&st, clients_json);
+    free(clients_json);
 
     if (st.n_targets == 0) {
-        free(aw_json);
         system("notify-send -t 3000 wlim 'no clickable elements found'");
         return 1;
     }
-
-    if (coords_ok(st.targets, st.n_targets)) {
-        for (int i = 0; i < st.n_targets; i++) {
-            st.targets[i].x += st.targets[i].w / 2;
-            st.targets[i].y += st.targets[i].h / 2;
-        }
-    } else {
-        grid_fallback(st.targets, st.n_targets, aw_json);
-    }
-    free(aw_json);
 
     generate_labels(st.targets, st.n_targets);
 
