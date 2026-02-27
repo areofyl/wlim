@@ -29,7 +29,6 @@ sudo dnf install gtk4-devel gtk4-layer-shell-devel at-spi2-core-devel ydotool
 ## build
 
 ```
-cd c
 make
 ```
 
