@@ -3,7 +3,7 @@
  *
  * walks the AT-SPI2 accessibility tree of all visible windows,
  * draws labeled hints over every clickable element using a
- * GTK4 + gtk4-layer-shell overlay, and clicks via ydotool
+ * GTK4 + gtk4-layer-shell overlay, and clicks via uinput
  * when you type a hint.
  *
  * build:
@@ -20,19 +20,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
 #include <errno.h>
+#include <linux/uinput.h>
+#include <linux/input-event-codes.h>
 
 #define MAX_TARGETS  1024
 #define MAX_LABEL    4
 #define MAX_TYPED    8
-
-/* ydotool absolute coordinates on hyprland don't map 1:1 to screen
- * pixels. this ratio was determined experimentally — your setup may
- * differ if you change monitor config or scale. */
-#define YDOTOOL_RATIO 2.375
 
 /* lookup table for clickable roles */
 static gboolean clickable_lut[256];
@@ -55,7 +54,9 @@ static void init_clickable_lut(void) {
 }
 
 typedef struct {
-    int x, y, w, h;
+    int x, y, w, h;   /* element bounds from AT-SPI */
+    int lx, ly;       /* label display position (top-left of element) */
+    int cx, cy;       /* click position (center of element) */
     char label[MAX_LABEL + 1];
 } Target;
 
@@ -148,7 +149,20 @@ static char *json_str(const char *j, const char *key, char *buf, size_t sz) {
     if (*p != '"') return buf;
     p++;
     size_t i = 0;
-    while (*p && *p != '"' && i < sz - 1) buf[i++] = *p++;
+    while (*p && *p != '"' && i < sz - 1) {
+        if (*p == '\\' && *(p + 1)) {
+            p++;
+            switch (*p) {
+                case '"': case '\\': case '/': buf[i++] = *p; break;
+                case 'n': buf[i++] = '\n'; break;
+                case 't': buf[i++] = '\t'; break;
+                default:  buf[i++] = *p; break;
+            }
+            p++;
+        } else {
+            buf[i++] = *p++;
+        }
+    }
     buf[i] = '\0';
     return buf;
 }
@@ -171,6 +185,20 @@ static void json_int_pair(const char *j, const char *key, int *a, int *b) {
 /*  hyprctl client geometry lookup                                     */
 /* ------------------------------------------------------------------ */
 
+/* find the matching '}' for a '{', handling nested braces */
+static const char *find_block_end(const char *p) {
+    int depth = 0;
+    gboolean in_str = FALSE;
+    for (; *p; p++) {
+        if (*p == '\\' && in_str) { p++; continue; }
+        if (*p == '"') { in_str = !in_str; continue; }
+        if (in_str) continue;
+        if (*p == '{') depth++;
+        else if (*p == '}') { depth--; if (depth == 0) return p; }
+    }
+    return NULL;
+}
+
 /* find the geometry of a hyprland client by matching its pid against
  * the clients json array. returns false if not found. */
 static gboolean find_client_geom(const char *clients_json, int pid,
@@ -178,15 +206,11 @@ static gboolean find_client_geom(const char *clients_json, int pid,
 {
     if (!clients_json || pid <= 0) return FALSE;
 
-    /* scan through the json array looking for objects with matching pid.
-     * we look for each '{' block and check the pid inside it. */
     const char *p = clients_json;
     while ((p = strchr(p, '{')) != NULL) {
-        /* find the end of this object */
-        const char *end = strchr(p, '}');
+        const char *end = find_block_end(p);
         if (!end) break;
 
-        /* extract pid from this object block */
         size_t blen = end - p + 1;
         char *block = malloc(blen + 1);
         memcpy(block, p, blen);
@@ -205,6 +229,23 @@ static gboolean find_client_geom(const char *clients_json, int pid,
     return FALSE;
 }
 
+/* check if two titles share a long enough common substring to be
+ * considered the same window (handles " - Audio playing" etc) */
+static gboolean titles_match(const char *a, const char *b) {
+    if (!a[0] || !b[0]) return FALSE;
+    if (strstr(a, b) || strstr(b, a)) return TRUE;
+    /* check if one title starts with the other's first N chars.
+     * chromium titles differ by suffixes like " - Audio playing" */
+    size_t la = strlen(a), lb = strlen(b);
+    size_t min = la < lb ? la : lb;
+    if (min > 10 && strncmp(a, b, min) == 0) return TRUE;
+    /* check shared prefix of at least 20 chars */
+    size_t common = 0;
+    while (common < la && common < lb && a[common] == b[common]) common++;
+    if (common >= 20) return TRUE;
+    return FALSE;
+}
+
 /* find client geometry by matching AT-SPI window title against
  * hyprctl client titles */
 static gboolean find_client_geom_by_title(const char *clients_json,
@@ -215,7 +256,7 @@ static gboolean find_client_geom_by_title(const char *clients_json,
 
     const char *p = clients_json;
     while ((p = strchr(p, '{')) != NULL) {
-        const char *end = strchr(p, '}');
+        const char *end = find_block_end(p);
         if (!end) break;
 
         size_t blen = end - p + 1;
@@ -226,8 +267,7 @@ static gboolean find_client_geom_by_title(const char *clients_json,
         char ctitle[256];
         json_str(block, "title", ctitle, sizeof(ctitle));
 
-        /* partial match — at-spi titles are often truncated */
-        if (ctitle[0] && (strstr(ctitle, title) || strstr(title, ctitle))) {
+        if (titles_match(ctitle, title)) {
             json_int_pair(block, "at", cx, cy);
             json_int_pair(block, "size", cw, ch);
             free(block);
@@ -267,6 +307,16 @@ static void generate_labels(Target *t, int n) {
 /*  at-spi tree walk                                                   */
 /* ------------------------------------------------------------------ */
 
+/* check if a target overlaps an existing one (nearly identical position) */
+static gboolean is_duplicate(Target *out, int n, int x, int y) {
+    for (int i = n - 1; i >= 0 && i >= n - 10; i--) {
+        int dx = abs(out[i].x - x);
+        int dy = abs(out[i].y - y);
+        if (dx <= 4 && dy <= 4) return TRUE;
+    }
+    return FALSE;
+}
+
 static void walk(AtspiAccessible *node, Target *out, int *n, int depth) {
     if (!node || depth > 30 || *n >= MAX_TARGETS) return;
 
@@ -290,10 +340,13 @@ static void walk(AtspiAccessible *node, Target *out, int *n, int depth) {
             AtspiRect *ext = atspi_component_get_extents(
                 comp, ATSPI_COORD_TYPE_SCREEN, &err);
             if (ext && !err) {
-                Target *t = &out[*n];
-                t->x = ext->x; t->y = ext->y;
-                t->w = ext->width; t->h = ext->height;
-                (*n)++;
+                if (ext->width > 0 && ext->height > 0 &&
+                    !is_duplicate(out, *n, ext->x, ext->y)) {
+                    Target *t = &out[*n];
+                    t->x = ext->x; t->y = ext->y;
+                    t->w = ext->width; t->h = ext->height;
+                    (*n)++;
+                }
             }
             if (ext) g_free(ext);
             if (err) g_error_free(err);
@@ -333,27 +386,32 @@ static void collect_all_targets(State *st, const char *clients_json) {
 
             int count = st->n_targets - start;
             if (count > 0) {
+                /* look up this window's actual geometry from hyprctl */
+                int wx = 0, wy = 0, ww = 0, wh = 0;
+                gboolean found = find_client_geom(clients_json,
+                                                   (int)app_pid,
+                                                   &wx, &wy, &ww, &wh);
+                if (!found) {
+                    gchar *wtitle = atspi_accessible_get_name(w, NULL);
+                    if (wtitle) {
+                        found = find_client_geom_by_title(clients_json,
+                                    wtitle, &wx, &wy, &ww, &wh);
+                        g_free(wtitle);
+                    }
+                }
+
+                gchar *dbg_name = atspi_accessible_get_name(w, NULL);
+                fprintf(stderr, "[wlim] window \"%s\": %d targets, geom found=%d at=(%d,%d) size=(%d,%d) pid_atspi=%d\n",
+                        dbg_name ? dbg_name : "?", count, found, wx, wy, ww, wh, (int)app_pid);
+                if (dbg_name) g_free(dbg_name);
+
                 /* check if this window's coords are usable */
                 int zeros = 0;
                 for (int t = start; t < st->n_targets; t++)
                     if (st->targets[t].x == 0 && st->targets[t].y == 0) zeros++;
 
                 if ((double)zeros / count >= 0.8) {
-                    /* broken coords — try to find this window's geometry
-                     * from hyprctl and distribute in a grid */
-                    int wx = 0, wy = 0, ww = 0, wh = 0;
-                    gboolean found = find_client_geom(clients_json,
-                                                       (int)app_pid,
-                                                       &wx, &wy, &ww, &wh);
-                    if (!found) {
-                        /* try matching by window title */
-                        gchar *wtitle = atspi_accessible_get_name(w, NULL);
-                        if (wtitle) {
-                            found = find_client_geom_by_title(clients_json,
-                                        wtitle, &wx, &wy, &ww, &wh);
-                            g_free(wtitle);
-                        }
-                    }
+                    /* broken coords (GTK4) — distribute in a grid */
                     if (found && ww > 0 && wh > 0) {
                         int m = 30;
                         int gx = wx + m, gy = wy + m;
@@ -363,18 +421,48 @@ static void collect_all_targets(State *st, const char *clients_json) {
                         double cw = (double)gw / (cols ? cols : 1);
                         double ch = (double)gh / (rows ? rows : 1);
                         for (int t = 0; t < count; t++) {
-                            st->targets[start + t].x = (int)(gx + (t % cols) * cw + cw / 2);
-                            st->targets[start + t].y = (int)(gy + (t / cols) * ch + ch / 2);
+                            int px = (int)(gx + (t % cols) * cw + cw / 2);
+                            int py = (int)(gy + (t / cols) * ch + ch / 2);
+                            st->targets[start + t].lx = px;
+                            st->targets[start + t].ly = py;
+                            st->targets[start + t].cx = px;
+                            st->targets[start + t].cy = py;
                         }
                     } else {
-                        /* can't find window geom — drop these targets */
                         st->n_targets = start;
                     }
                 } else {
-                    /* good coords — center them */
+                    /* coords are present — check if they're window-relative.
+                     * on wayland, some apps (chromium) report AT-SPI coords
+                     * relative to the window instead of the screen. detect
+                     * this by checking if all coords fall within [0, ww) x
+                     * [0, wh) rather than [wx, wx+ww) x [wy, wy+wh). */
+                    int off_x = 0, off_y = 0;
+                    if (found && ww > 0 && wh > 0 && (wx > 0 || wy > 0)) {
+                        int window_rel = 0;
+                        for (int t = start; t < st->n_targets; t++) {
+                            Target *tg = &st->targets[t];
+                            if (tg->x >= 0 && tg->x < ww &&
+                                tg->y >= 0 && tg->y < wh)
+                                window_rel++;
+                        }
+                        /* if most coords fit inside [0,ww)x[0,wh) but the
+                         * window isn't at (0,0), they're window-relative */
+                        fprintf(stderr, "[wlim]   window_rel=%d/%d (%.0f%%)\n",
+                                window_rel, count, 100.0 * window_rel / count);
+                        if ((double)window_rel / count >= 0.8) {
+                            off_x = wx;
+                            off_y = wy;
+                            fprintf(stderr, "[wlim]   applying offset (%d,%d)\n", off_x, off_y);
+                        }
+                    }
+
                     for (int t = start; t < st->n_targets; t++) {
-                        st->targets[t].x += st->targets[t].w / 2;
-                        st->targets[t].y += st->targets[t].h / 2;
+                        Target *tg = &st->targets[t];
+                        tg->cx = tg->x + off_x + tg->w / 2;
+                        tg->cy = tg->y + off_y + tg->h / 2;
+                        tg->lx = tg->x + off_x + 16;
+                        tg->ly = tg->y + off_y + 8;
                     }
                 }
             }
@@ -386,32 +474,124 @@ static void collect_all_targets(State *st, const char *clients_json) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  ydotool — direct exec, no shell                                    */
+/*  uinput — direct virtual input device                               */
 /* ------------------------------------------------------------------ */
 
+/* get the total screen bounding box from hyprctl monitors.
+ * for multi-monitor setups this returns the combined extent. */
+static void get_screen_bounds(int *total_w, int *total_h) {
+    char *json = hyprctl_request("j/monitors");
+    *total_w = 1920;
+    *total_h = 1080;
+    if (!json) return;
+
+    int max_x = 0, max_y = 0;
+    const char *p = json;
+    while ((p = strchr(p, '{')) != NULL) {
+        const char *end = find_block_end(p);
+        if (!end) break;
+
+        size_t blen = end - p + 1;
+        char *block = malloc(blen + 1);
+        memcpy(block, p, blen);
+        block[blen] = '\0';
+
+        int mx = json_int(block, "x", 0);
+        int my = json_int(block, "y", 0);
+        int mw = json_int(block, "width", 0);
+        int mh = json_int(block, "height", 0);
+
+        if (mx + mw > max_x) max_x = mx + mw;
+        if (my + mh > max_y) max_y = my + mh;
+
+        free(block);
+        p = end + 1;
+    }
+    free(json);
+
+    if (max_x > 0) *total_w = max_x;
+    if (max_y > 0) *total_h = max_y;
+}
+
+static void emit(int fd, int type, int code, int val) {
+    struct input_event ev = {0};
+    ev.type = type;
+    ev.code = code;
+    ev.value = val;
+    write(fd, &ev, sizeof(ev));
+}
+
 static void do_click(int x, int y) {
-    int yx = (int)round((double)x / YDOTOOL_RATIO);
-    int yy = (int)round((double)y / YDOTOOL_RATIO);
+    int sw, sh;
+    get_screen_bounds(&sw, &sh);
 
-    char sx[16], sy[16];
-    snprintf(sx, sizeof(sx), "%d", yx);
-    snprintf(sy, sizeof(sy), "%d", yy);
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        setenv("YDOTOOL_SOCKET", "/tmp/.ydotool_socket", 1);
-        execlp("ydotool", "ydotool", "mousemove", "-a", "-x", sx, "-y", sy, NULL);
-        _exit(1);
+    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        fprintf(stderr, "[wlim] cannot open /dev/uinput: %s\n", strerror(errno));
+        return;
     }
-    if (pid > 0) waitpid(pid, NULL, 0);
 
-    pid = fork();
-    if (pid == 0) {
-        setenv("YDOTOOL_SOCKET", "/tmp/.ydotool_socket", 1);
-        execlp("ydotool", "ydotool", "click", "0xC0", NULL);
-        _exit(1);
-    }
-    if (pid > 0) waitpid(pid, NULL, 0);
+    /* enable event types */
+    ioctl(fd, UI_SET_EVBIT, EV_ABS);
+    ioctl(fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(fd, UI_SET_EVBIT, EV_SYN);
+    ioctl(fd, UI_SET_ABSBIT, ABS_X);
+    ioctl(fd, UI_SET_ABSBIT, ABS_Y);
+    ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);
+
+    /* configure abs axes to match screen pixel dimensions */
+    struct uinput_abs_setup abs_x = {0};
+    abs_x.code = ABS_X;
+    abs_x.absinfo.minimum = 0;
+    abs_x.absinfo.maximum = sw - 1;
+    ioctl(fd, UI_ABS_SETUP, &abs_x);
+
+    struct uinput_abs_setup abs_y = {0};
+    abs_y.code = ABS_Y;
+    abs_y.absinfo.minimum = 0;
+    abs_y.absinfo.maximum = sh - 1;
+    ioctl(fd, UI_ABS_SETUP, &abs_y);
+
+    /* create the device */
+    struct uinput_setup setup = {0};
+    snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "wlim-pointer");
+    setup.id.bustype = BUS_VIRTUAL;
+    setup.id.vendor  = 0x1234;
+    setup.id.product = 0x5678;
+    setup.id.version = 1;
+    ioctl(fd, UI_DEV_SETUP, &setup);
+    ioctl(fd, UI_DEV_CREATE);
+
+    /* small delay for compositor to register the new device */
+    usleep(50000);
+
+    /* clamp coordinates */
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= sw) x = sw - 1;
+    if (y >= sh) y = sh - 1;
+
+    fprintf(stderr, "[wlim] clicking at (%d,%d) screen=(%dx%d)\n", x, y, sw, sh);
+
+    /* move to position */
+    emit(fd, EV_ABS, ABS_X, x);
+    emit(fd, EV_ABS, ABS_Y, y);
+    emit(fd, EV_SYN, SYN_REPORT, 0);
+    usleep(20000);
+
+    /* press */
+    emit(fd, EV_KEY, BTN_LEFT, 1);
+    emit(fd, EV_SYN, SYN_REPORT, 0);
+    usleep(20000);
+
+    /* release */
+    emit(fd, EV_KEY, BTN_LEFT, 0);
+    emit(fd, EV_SYN, SYN_REPORT, 0);
+    usleep(20000);
+
+    /* destroy */
+    ioctl(fd, UI_DEV_DESTROY);
+    close(fd);
 }
 
 /* ------------------------------------------------------------------ */
@@ -466,8 +646,8 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         if (strcmp(s->targets[i].label, s->typed) == 0) { mi = i; mc++; }
     if (mc == 1) {
         s->should_click = TRUE;
-        s->click_x = s->targets[mi].x;
-        s->click_y = s->targets[mi].y;
+        s->click_x = s->targets[mi].cx;
+        s->click_y = s->targets[mi].cy;
         gtk_window_destroy(GTK_WINDOW(s->win));
         return TRUE;
     }
@@ -521,7 +701,7 @@ static void on_activate(GtkApplication *app, gpointer data) {
     for (int i = 0; i < s->n_targets; i++) {
         GtkWidget *lbl = gtk_label_new(s->targets[i].label);
         gtk_widget_add_css_class(lbl, "hint-label");
-        gtk_fixed_put(GTK_FIXED(fixed), lbl, s->targets[i].x, s->targets[i].y);
+        gtk_fixed_put(GTK_FIXED(fixed), lbl, s->targets[i].lx, s->targets[i].ly);
         s->hint_labels[i] = lbl;
     }
 
