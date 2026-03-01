@@ -12,6 +12,7 @@ vimium-like click hints for wayland. press a keybind, get letter labels on every
 4. shows letter labels at each element's position
 5. you type the letters, overlay closes, uinput clicks that spot
 6. hold shift while typing the last letter to right-click instead
+7. hold ctrl while typing the last letter to middle-click instead
 
 ## dependencies
 
