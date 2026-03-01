@@ -70,6 +70,7 @@ typedef struct {
     char    typed[MAX_TYPED + 1];
     int     typed_len;
     int     click_x, click_y;
+    int     click_button;  /* BTN_LEFT, BTN_RIGHT, or BTN_MIDDLE */
     gboolean should_click;
 } State;
 
@@ -521,7 +522,7 @@ static void emit(int fd, int type, int code, int val) {
     write(fd, &ev, sizeof(ev));
 }
 
-static void do_click(int x, int y) {
+static void do_click(int x, int y, int button) {
     int sw, sh;
     get_screen_bounds(&sw, &sh);
 
@@ -537,7 +538,7 @@ static void do_click(int x, int y) {
     ioctl(fd, UI_SET_EVBIT, EV_SYN);
     ioctl(fd, UI_SET_ABSBIT, ABS_X);
     ioctl(fd, UI_SET_ABSBIT, ABS_Y);
-    ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);
+    ioctl(fd, UI_SET_KEYBIT, button);
 
     /* configure abs axes to match screen pixel dimensions */
     struct uinput_abs_setup abs_x = {0};
@@ -571,7 +572,8 @@ static void do_click(int x, int y) {
     if (x >= sw) x = sw - 1;
     if (y >= sh) y = sh - 1;
 
-    fprintf(stderr, "[wlim] clicking at (%d,%d) screen=(%dx%d)\n", x, y, sw, sh);
+    const char *bname = button == BTN_RIGHT ? "right" : button == BTN_MIDDLE ? "middle" : "left";
+    fprintf(stderr, "[wlim] %s-clicking at (%d,%d) screen=(%dx%d)\n", bname, x, y, sw, sh);
 
     /* move to position */
     emit(fd, EV_ABS, ABS_X, x);
@@ -580,12 +582,12 @@ static void do_click(int x, int y) {
     usleep(20000);
 
     /* press */
-    emit(fd, EV_KEY, BTN_LEFT, 1);
+    emit(fd, EV_KEY, button, 1);
     emit(fd, EV_SYN, SYN_REPORT, 0);
     usleep(20000);
 
     /* release */
-    emit(fd, EV_KEY, BTN_LEFT, 0);
+    emit(fd, EV_KEY, button, 0);
     emit(fd, EV_SYN, SYN_REPORT, 0);
     usleep(20000);
 
@@ -870,6 +872,7 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         s->should_click = TRUE;
         s->click_x = s->targets[mi].cx;
         s->click_y = s->targets[mi].cy;
+        s->click_button = (mod & GDK_SHIFT_MASK) ? BTN_RIGHT : BTN_LEFT;
         gtk_window_destroy(GTK_WINDOW(s->win));
         return TRUE;
     }
@@ -937,7 +940,7 @@ static void on_shutdown(GtkApplication *app, gpointer data) {
     State *s = data;
     if (s->should_click) {
         usleep(150000);
-        do_click(s->click_x, s->click_y);
+        do_click(s->click_x, s->click_y, s->click_button);
     }
 }
 
