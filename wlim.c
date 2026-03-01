@@ -58,6 +58,7 @@ typedef struct {
     int lx, ly;       /* label display position (top-left of element) */
     int cx, cy;       /* click position (center of element) */
     char label[MAX_LABEL + 1];
+    char name[128];   /* element text from AT-SPI */
 } Target;
 
 typedef struct {
@@ -72,6 +73,9 @@ typedef struct {
     int     click_x, click_y;
     int     click_button;  /* BTN_LEFT, BTN_RIGHT, or BTN_MIDDLE */
     gboolean should_click;
+    gboolean search_mode;
+    char    search[64];
+    int     search_len;
 } State;
 
 /* ------------------------------------------------------------------ */
@@ -346,6 +350,14 @@ static void walk(AtspiAccessible *node, Target *out, int *n, int depth) {
                     Target *t = &out[*n];
                     t->x = ext->x; t->y = ext->y;
                     t->w = ext->width; t->h = ext->height;
+                    gchar *nm = atspi_accessible_get_name(node, NULL);
+                    if (nm) {
+                        strncpy(t->name, nm, sizeof(t->name) - 1);
+                        t->name[sizeof(t->name) - 1] = '\0';
+                        g_free(nm);
+                    } else {
+                        t->name[0] = '\0';
+                    }
                     (*n)++;
                 }
             }
@@ -822,6 +834,52 @@ static int scroll_main(void) {
 /*  hint mode — overlay                                                */
 /* ------------------------------------------------------------------ */
 
+static gboolean strcasestr_match(const char *hay, const char *needle) {
+    if (!needle[0]) return TRUE;
+    size_t nlen = strlen(needle);
+    for (; *hay; hay++) {
+        if (g_ascii_tolower(*hay) == g_ascii_tolower(needle[0]) &&
+            g_ascii_strncasecmp(hay, needle, nlen) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void apply_search_filter(State *s) {
+    /* hide hints that don't match search, show those that do */
+    int visible = 0;
+    for (int i = 0; i < s->n_targets; i++) {
+        gboolean match = strcasestr_match(s->targets[i].name, s->search);
+        gtk_widget_set_visible(s->hint_labels[i], match);
+        if (match) visible++;
+    }
+    fprintf(stderr, "[wlim] search \"%s\": %d matches\n", s->search, visible);
+}
+
+static void relabel_visible(State *s) {
+    /* re-generate short labels for only the visible (filtered) targets */
+    int visible[MAX_TARGETS], nv = 0;
+    for (int i = 0; i < s->n_targets; i++)
+        if (gtk_widget_get_visible(s->hint_labels[i]))
+            visible[nv++] = i;
+
+    /* generate labels for nv items */
+    Target tmp[MAX_TARGETS];
+    for (int i = 0; i < nv; i++) tmp[i] = s->targets[visible[i]];
+    generate_labels(tmp, nv);
+
+    /* clear all labels first */
+    for (int i = 0; i < s->n_targets; i++)
+        s->targets[i].label[0] = '\0';
+
+    /* assign new labels and update widgets */
+    for (int i = 0; i < nv; i++) {
+        int idx = visible[i];
+        strcpy(s->targets[idx].label, tmp[i].label);
+        gtk_label_set_text(GTK_LABEL(s->hint_labels[idx]), tmp[i].label);
+    }
+}
+
 static void update_hints(State *s) {
     for (int i = 0; i < s->n_targets; i++) {
         const char *l = s->targets[i].label;
@@ -851,6 +909,41 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         g_application_quit(G_APPLICATION(s->app));
         return TRUE;
     }
+
+    /* enter search mode with / */
+    if (keyval == '/' && !s->search_mode) {
+        s->search_mode = TRUE;
+        s->search_len = 0;
+        s->search[0] = '\0';
+        return TRUE;
+    }
+
+    /* search mode: type to filter, Enter to confirm, BackSpace to delete */
+    if (s->search_mode) {
+        if (g_strcmp0(kn, "Return") == 0) {
+            s->search_mode = FALSE;
+            relabel_visible(s);
+            s->typed_len = 0;
+            s->typed[0] = '\0';
+            return TRUE;
+        }
+        if (g_strcmp0(kn, "BackSpace") == 0) {
+            if (s->search_len > 0) {
+                s->search[--s->search_len] = '\0';
+                apply_search_filter(s);
+            }
+            return TRUE;
+        }
+        char sch = 0;
+        if (keyval >= 0x20 && keyval <= 0x7e) sch = (char)keyval;
+        if (sch && s->search_len < (int)sizeof(s->search) - 1) {
+            s->search[s->search_len++] = sch;
+            s->search[s->search_len] = '\0';
+            apply_search_filter(s);
+        }
+        return TRUE;
+    }
+
     if (g_strcmp0(kn, "BackSpace") == 0) {
         if (s->typed_len > 0) { s->typed[--s->typed_len] = '\0'; update_hints(s); }
         return TRUE;
