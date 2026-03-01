@@ -73,6 +73,7 @@ typedef struct {
     int     click_button;  /* BTN_LEFT, BTN_RIGHT, or BTN_MIDDLE */
     gboolean double_click;
     gboolean should_click;
+    gboolean force_double;  /* --double flag */
 } State;
 
 /* ------------------------------------------------------------------ */
@@ -860,9 +861,6 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
     char ch = 0;
     if (keyval >= 'a' && keyval <= 'z') ch = (char)keyval;
     else if (keyval >= 'A' && keyval <= 'Z') ch = (char)(keyval + 32);
-    /* Ctrl transforms keyvals to control chars (e.g., Ctrl+A = 1);
-     * recover the base letter for modifier combos */
-    if (!ch && keyval >= 1 && keyval <= 26) ch = (char)('a' + keyval - 1);
     if (!ch || s->typed_len >= MAX_TYPED) return TRUE;
 
     s->typed[s->typed_len++] = ch;
@@ -876,16 +874,10 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         s->should_click = TRUE;
         s->click_x = s->targets[mi].cx;
         s->click_y = s->targets[mi].cy;
-        if ((mod & GDK_SHIFT_MASK) && (mod & GDK_CONTROL_MASK)) {
-            s->click_button = BTN_LEFT;
-            s->double_click = TRUE;
-        } else if (mod & GDK_SHIFT_MASK) {
-            s->click_button = BTN_RIGHT;
-        } else if (mod & GDK_CONTROL_MASK) {
-            s->click_button = BTN_MIDDLE;
-        } else {
-            s->click_button = BTN_LEFT;
-        }
+        s->click_button = (mod & GDK_SHIFT_MASK) ? BTN_RIGHT
+                        : (mod & GDK_CONTROL_MASK) ? BTN_MIDDLE
+                        : BTN_LEFT;
+        s->double_click = s->force_double;
         gtk_window_destroy(GTK_WINDOW(s->win));
         return TRUE;
     }
@@ -962,10 +954,12 @@ static void on_shutdown(GtkApplication *app, gpointer data) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[]) {
-    /* check for --scroll mode */
+    /* check for flags */
     gboolean scroll_mode = FALSE;
+    gboolean double_mode = FALSE;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--scroll") == 0) scroll_mode = TRUE;
+        if (strcmp(argv[i], "--double") == 0) double_mode = TRUE;
     }
 
     if (scroll_mode) return scroll_main();
@@ -977,6 +971,7 @@ int main(int argc, char *argv[]) {
     char *clients_json = hyprctl_request("j/clients");
 
     State st = {0};
+    st.force_double = double_mode;
     collect_all_targets(&st, clients_json);
     free(clients_json);
 
