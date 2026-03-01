@@ -67,6 +67,25 @@ bind = $mainMod SHIFT, semicolon, exec, /path/to/wlim --scroll
 
 ```
 
+## config
+
+create `~/.config/wlim/config` to customize. all keys are optional — defaults are used for anything missing.
+
+```
+# hint appearance
+hint_bg=#2a2a2a
+hint_fg=#e0e0e0
+hint_fg_dim=#666
+hint_border=rgba(255,255,255,0.6)
+hint_font_size=11
+hint_border_radius=4
+
+# scroll speeds (in wheel ticks)
+scroll_speed=1
+page_speed=10
+jump_speed=200
+```
+
 ## scroll mode
 
 `wlim --scroll` gives you vim-style keyboard scrolling. it grabs the keyboard and emits scroll events via uinput.
