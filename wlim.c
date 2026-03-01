@@ -952,6 +952,7 @@ static void on_activate(GtkApplication *app, gpointer data) {
     }
 
     GtkEventController *kc = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(kc, GTK_PHASE_CAPTURE);
     g_signal_connect(kc, "key-pressed", G_CALLBACK(on_key), s);
     gtk_widget_add_controller(win, kc);
     gtk_window_present(GTK_WINDOW(win));
