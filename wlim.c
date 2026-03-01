@@ -830,8 +830,8 @@ static void update_hints(State *s) {
             char mk[128], matched[MAX_LABEL+1] = {0};
             strncpy(matched, l, s->typed_len);
             snprintf(mk, sizeof(mk),
-                "<span foreground=\"#5a7a2a\">%s</span>"
-                "<span foreground=\"#b5e853\">%s</span>",
+                "<span foreground=\"#666\">%s</span>"
+                "<span foreground=\"#e0e0e0\">%s</span>",
                 matched, l + s->typed_len);
             gtk_label_set_markup(GTK_LABEL(s->hint_labels[i]), mk);
         } else {
@@ -906,14 +906,14 @@ static void on_activate(GtkApplication *app, gpointer data) {
     gtk_css_provider_load_from_string(css,
         "window { background: rgba(0,0,0,0.01); }\n"
         ".hint-label {\n"
-        "  background: #1a1a1a;\n"
-        "  color: #b5e853;\n"
+        "  background: #2a2a2a;\n"
+        "  color: #e0e0e0;\n"
         "  font-size: 11px;\n"
         "  font-weight: bold;\n"
         "  font-family: monospace;\n"
-        "  padding: 0px 4px;\n"
-        "  border-radius: 0px;\n"
-        "  border: 1px solid #333;\n"
+        "  padding: 1px 6px;\n"
+        "  border-radius: 4px;\n"
+        "  border: 1px solid #444;\n"
         "}\n");
     gtk_style_context_add_provider_for_display(
         gdk_display_get_default(), GTK_STYLE_PROVIDER(css),
