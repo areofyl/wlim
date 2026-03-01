@@ -13,7 +13,7 @@ vimium-like click hints for wayland. press a keybind, get letter labels on every
 5. you type the letters, overlay closes, uinput clicks that spot
 6. hold shift while typing the last letter to right-click instead
 7. hold ctrl while typing the last letter to middle-click instead
-8. hold ctrl+shift while typing the last letter to double-click
+8. use `wlim --double` to double-click instead of single-click
 
 
 ## dependencies
@@ -63,6 +63,7 @@ flatpak override --user --env=ACCESSIBILITY_ENABLED=1 io.github.nickvision.chrom
 ```
 bind = $mainMod, semicolon, exec, /path/to/wlim
 bind = $mainMod SHIFT, semicolon, exec, /path/to/wlim --scroll
+bind = $mainMod CTRL, semicolon, exec, /path/to/wlim --double
 ```
 
 ## scroll mode
