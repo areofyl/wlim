@@ -861,6 +861,22 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
     char ch = 0;
     if (keyval >= 'a' && keyval <= 'z') ch = (char)keyval;
     else if (keyval >= 'A' && keyval <= 'Z') ch = (char)(keyval + 32);
+    /* Alt modifies keyval to something outside a-z on many setups;
+     * recover the base letter from the hardware keycode (QWERTY layout:
+     * keycodes 10-19 = 1234567890, 24-33 = qwertyuiop, 38-46 = asdfghjkl,
+     * 52-58 = zxcvbnm) */
+    if (!ch && (mod & GDK_ALT_MASK)) {
+        static const char qwerty[] = {
+            [24]='q',[25]='w',[26]='e',[27]='r',[28]='t',
+            [29]='y',[30]='u',[31]='i',[32]='o',[33]='p',
+            [38]='a',[39]='s',[40]='d',[41]='f',[42]='g',
+            [43]='h',[44]='j',[45]='k',[46]='l',
+            [52]='z',[53]='x',[54]='c',[55]='v',[56]='b',
+            [57]='n',[58]='m',
+        };
+        if (keycode < sizeof(qwerty) && qwerty[keycode])
+            ch = qwerty[keycode];
+    }
     if (!ch || s->typed_len >= MAX_TYPED) return TRUE;
 
     s->typed[s->typed_len++] = ch;
