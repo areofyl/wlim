@@ -70,8 +70,9 @@ typedef struct {
     char    typed[MAX_TYPED + 1];
     int     typed_len;
     int     click_x, click_y;
-    int     click_button;  /* BTN_LEFT, BTN_RIGHT, or BTN_MIDDLE */
+    int     click_button;  /* BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, or 0 (hover) */
     gboolean should_click;
+    gboolean tab_held;
 } State;
 
 /* ------------------------------------------------------------------ */
@@ -858,25 +859,14 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         return TRUE;
     }
 
+    if (g_strcmp0(kn, "Tab") == 0 || g_strcmp0(kn, "ISO_Left_Tab") == 0) {
+        s->tab_held = TRUE;
+        return TRUE;
+    }
+
     char ch = 0;
     if (keyval >= 'a' && keyval <= 'z') ch = (char)keyval;
     else if (keyval >= 'A' && keyval <= 'Z') ch = (char)(keyval + 32);
-    /* Alt modifies keyval to something outside a-z on many setups;
-     * recover the base letter from the hardware keycode (QWERTY layout:
-     * keycodes 10-19 = 1234567890, 24-33 = qwertyuiop, 38-46 = asdfghjkl,
-     * 52-58 = zxcvbnm) */
-    if (!ch && (mod & GDK_ALT_MASK)) {
-        static const char qwerty[] = {
-            [24]='q',[25]='w',[26]='e',[27]='r',[28]='t',
-            [29]='y',[30]='u',[31]='i',[32]='o',[33]='p',
-            [38]='a',[39]='s',[40]='d',[41]='f',[42]='g',
-            [43]='h',[44]='j',[45]='k',[46]='l',
-            [52]='z',[53]='x',[54]='c',[55]='v',[56]='b',
-            [57]='n',[58]='m',
-        };
-        if (keycode < sizeof(qwerty) && qwerty[keycode])
-            ch = qwerty[keycode];
-    }
     if (!ch || s->typed_len >= MAX_TYPED) return TRUE;
 
     s->typed[s->typed_len++] = ch;
@@ -890,7 +880,7 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         s->should_click = TRUE;
         s->click_x = s->targets[mi].cx;
         s->click_y = s->targets[mi].cy;
-        s->click_button = (mod & GDK_ALT_MASK) ? 0  /* hover only */
+        s->click_button = s->tab_held ? 0  /* hover only */
                         : (mod & GDK_SHIFT_MASK) ? BTN_RIGHT
                         : (mod & GDK_CONTROL_MASK) ? BTN_MIDDLE
                         : BTN_LEFT;
@@ -904,6 +894,15 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
     if (!any) { s->typed_len = 0; s->typed[0] = '\0'; update_hints(s); }
 
     return TRUE;
+}
+
+static void on_key_released(GtkEventControllerKey *ctrl, guint keyval,
+                             guint keycode, GdkModifierType mod, gpointer data)
+{
+    State *s = data;
+    const char *kn = gdk_keyval_name(keyval);
+    if (g_strcmp0(kn, "Tab") == 0 || g_strcmp0(kn, "ISO_Left_Tab") == 0)
+        s->tab_held = FALSE;
 }
 
 static void on_activate(GtkApplication *app, gpointer data) {
@@ -954,6 +953,7 @@ static void on_activate(GtkApplication *app, gpointer data) {
     GtkEventController *kc = gtk_event_controller_key_new();
     gtk_event_controller_set_propagation_phase(kc, GTK_PHASE_CAPTURE);
     g_signal_connect(kc, "key-pressed", G_CALLBACK(on_key), s);
+    g_signal_connect(kc, "key-released", G_CALLBACK(on_key_released), s);
     gtk_widget_add_controller(win, kc);
     gtk_window_present(GTK_WINDOW(win));
 }
