@@ -860,6 +860,9 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
     char ch = 0;
     if (keyval >= 'a' && keyval <= 'z') ch = (char)keyval;
     else if (keyval >= 'A' && keyval <= 'Z') ch = (char)(keyval + 32);
+    /* Ctrl transforms keyvals to control chars (e.g., Ctrl+A = 1);
+     * recover the base letter for modifier combos */
+    if (!ch && keyval >= 1 && keyval <= 26) ch = (char)('a' + keyval - 1);
     if (!ch || s->typed_len >= MAX_TYPED) return TRUE;
 
     s->typed[s->typed_len++] = ch;
