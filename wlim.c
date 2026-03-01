@@ -71,6 +71,7 @@ typedef struct {
     int     typed_len;
     int     click_x, click_y;
     int     click_button;  /* BTN_LEFT, BTN_RIGHT, or BTN_MIDDLE */
+    gboolean double_click;
     gboolean should_click;
 } State;
 
@@ -522,7 +523,7 @@ static void emit(int fd, int type, int code, int val) {
     write(fd, &ev, sizeof(ev));
 }
 
-static void do_click(int x, int y, int button) {
+static void do_click(int x, int y, int button, gboolean double_click) {
     int sw, sh;
     get_screen_bounds(&sw, &sh);
 
@@ -573,7 +574,8 @@ static void do_click(int x, int y, int button) {
     if (y >= sh) y = sh - 1;
 
     const char *bname = button == BTN_RIGHT ? "right" : button == BTN_MIDDLE ? "middle" : "left";
-    fprintf(stderr, "[wlim] %s-clicking at (%d,%d) screen=(%dx%d)\n", bname, x, y, sw, sh);
+    fprintf(stderr, "[wlim] %s%s-clicking at (%d,%d) screen=(%dx%d)\n",
+            double_click ? "double-" : "", bname, x, y, sw, sh);
 
     /* move to position */
     emit(fd, EV_ABS, ABS_X, x);
@@ -581,15 +583,15 @@ static void do_click(int x, int y, int button) {
     emit(fd, EV_SYN, SYN_REPORT, 0);
     usleep(20000);
 
-    /* press */
-    emit(fd, EV_KEY, button, 1);
-    emit(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(20000);
-
-    /* release */
-    emit(fd, EV_KEY, button, 0);
-    emit(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(20000);
+    int clicks = double_click ? 2 : 1;
+    for (int c = 0; c < clicks; c++) {
+        emit(fd, EV_KEY, button, 1);
+        emit(fd, EV_SYN, SYN_REPORT, 0);
+        usleep(20000);
+        emit(fd, EV_KEY, button, 0);
+        emit(fd, EV_SYN, SYN_REPORT, 0);
+        if (c < clicks - 1) usleep(20000);
+    }
 
     /* destroy */
     ioctl(fd, UI_DEV_DESTROY);
@@ -871,9 +873,16 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         s->should_click = TRUE;
         s->click_x = s->targets[mi].cx;
         s->click_y = s->targets[mi].cy;
-        s->click_button = (mod & GDK_SHIFT_MASK) ? BTN_RIGHT
-                        : (mod & GDK_CONTROL_MASK) ? BTN_MIDDLE
-                        : BTN_LEFT;
+        if ((mod & GDK_SHIFT_MASK) && (mod & GDK_CONTROL_MASK)) {
+            s->click_button = BTN_LEFT;
+            s->double_click = TRUE;
+        } else if (mod & GDK_SHIFT_MASK) {
+            s->click_button = BTN_RIGHT;
+        } else if (mod & GDK_CONTROL_MASK) {
+            s->click_button = BTN_MIDDLE;
+        } else {
+            s->click_button = BTN_LEFT;
+        }
         gtk_window_destroy(GTK_WINDOW(s->win));
         return TRUE;
     }
@@ -941,7 +950,7 @@ static void on_shutdown(GtkApplication *app, gpointer data) {
     State *s = data;
     if (s->should_click) {
         usleep(150000);
-        do_click(s->click_x, s->click_y, s->click_button);
+        do_click(s->click_x, s->click_y, s->click_button, s->double_click);
     }
 }
 
