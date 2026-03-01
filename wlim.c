@@ -70,9 +70,8 @@ typedef struct {
     char    typed[MAX_TYPED + 1];
     int     typed_len;
     int     click_x, click_y;
-    int     click_button;  /* BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, or 0 (hover) */
+    int     click_button;  /* BTN_LEFT, BTN_RIGHT, or BTN_MIDDLE */
     gboolean should_click;
-    gboolean hover_mode;
 } State;
 
 /* ------------------------------------------------------------------ */
@@ -535,11 +534,11 @@ static void do_click(int x, int y, int button) {
 
     /* enable event types */
     ioctl(fd, UI_SET_EVBIT, EV_ABS);
-    if (button) ioctl(fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(fd, UI_SET_EVBIT, EV_KEY);
     ioctl(fd, UI_SET_EVBIT, EV_SYN);
     ioctl(fd, UI_SET_ABSBIT, ABS_X);
     ioctl(fd, UI_SET_ABSBIT, ABS_Y);
-    if (button) ioctl(fd, UI_SET_KEYBIT, button);
+    ioctl(fd, UI_SET_KEYBIT, button);
 
     /* configure abs axes to match screen pixel dimensions */
     struct uinput_abs_setup abs_x = {0};
@@ -573,8 +572,8 @@ static void do_click(int x, int y, int button) {
     if (x >= sw) x = sw - 1;
     if (y >= sh) y = sh - 1;
 
-    const char *bname = !button ? "hover" : button == BTN_RIGHT ? "right" : button == BTN_MIDDLE ? "middle" : "left";
-    fprintf(stderr, "[wlim] %s at (%d,%d) screen=(%dx%d)\n", bname, x, y, sw, sh);
+    const char *bname = button == BTN_RIGHT ? "right" : button == BTN_MIDDLE ? "middle" : "left";
+    fprintf(stderr, "[wlim] %s-clicking at (%d,%d) screen=(%dx%d)\n", bname, x, y, sw, sh);
 
     /* move to position */
     emit(fd, EV_ABS, ABS_X, x);
@@ -582,17 +581,15 @@ static void do_click(int x, int y, int button) {
     emit(fd, EV_SYN, SYN_REPORT, 0);
     usleep(20000);
 
-    if (button) {
-        /* press */
-        emit(fd, EV_KEY, button, 1);
-        emit(fd, EV_SYN, SYN_REPORT, 0);
-        usleep(20000);
+    /* press */
+    emit(fd, EV_KEY, button, 1);
+    emit(fd, EV_SYN, SYN_REPORT, 0);
+    usleep(20000);
 
-        /* release */
-        emit(fd, EV_KEY, button, 0);
-        emit(fd, EV_SYN, SYN_REPORT, 0);
-        usleep(20000);
-    }
+    /* release */
+    emit(fd, EV_KEY, button, 0);
+    emit(fd, EV_SYN, SYN_REPORT, 0);
+    usleep(20000);
 
     /* destroy */
     ioctl(fd, UI_DEV_DESTROY);
@@ -858,11 +855,6 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         if (s->typed_len > 0) { s->typed[--s->typed_len] = '\0'; update_hints(s); }
         return TRUE;
     }
-    if (g_strcmp0(kn, "period") == 0) {
-        s->hover_mode = !s->hover_mode;
-        return TRUE;
-    }
-
     char ch = 0;
     if (keyval >= 'a' && keyval <= 'z') ch = (char)keyval;
     else if (keyval >= 'A' && keyval <= 'Z') ch = (char)(keyval + 32);
@@ -879,8 +871,7 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         s->should_click = TRUE;
         s->click_x = s->targets[mi].cx;
         s->click_y = s->targets[mi].cy;
-        s->click_button = s->hover_mode ? 0  /* hover only */
-                        : (mod & GDK_SHIFT_MASK) ? BTN_RIGHT
+        s->click_button = (mod & GDK_SHIFT_MASK) ? BTN_RIGHT
                         : (mod & GDK_CONTROL_MASK) ? BTN_MIDDLE
                         : BTN_LEFT;
         gtk_window_destroy(GTK_WINDOW(s->win));
@@ -941,7 +932,6 @@ static void on_activate(GtkApplication *app, gpointer data) {
     }
 
     GtkEventController *kc = gtk_event_controller_key_new();
-    gtk_event_controller_set_propagation_phase(kc, GTK_PHASE_CAPTURE);
     g_signal_connect(kc, "key-pressed", G_CALLBACK(on_key), s);
     gtk_widget_add_controller(win, kc);
     gtk_window_present(GTK_WINDOW(win));
