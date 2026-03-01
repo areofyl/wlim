@@ -1018,7 +1018,7 @@ static void on_activate(GtkApplication *app, gpointer data) {
         "  font-family: monospace;\n"
         "  padding: 1px 6px;\n"
         "  border-radius: 4px;\n"
-        "  border: 1px solid #444;\n"
+        "  border: 1px solid rgba(255,255,255,0.6);\n"
         "}\n"
         ".search-box {\n"
         "  background: #1a1a1a;\n"
