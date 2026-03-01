@@ -33,6 +33,88 @@
 #define MAX_LABEL    4
 #define MAX_TYPED    8
 
+/* ------------------------------------------------------------------ */
+/*  configuration                                                      */
+/* ------------------------------------------------------------------ */
+
+static struct {
+    char hint_bg[32];
+    char hint_fg[32];
+    char hint_fg_dim[32];
+    char hint_border[32];
+    int  hint_font_size;
+    int  hint_border_radius;
+    int  scroll_speed;      /* ticks per j/k press */
+    int  page_speed;        /* ticks per d/u press */
+    int  jump_speed;        /* ticks per G/gg */
+} cfg = {
+    .hint_bg           = "#2a2a2a",
+    .hint_fg           = "#e0e0e0",
+    .hint_fg_dim       = "#666",
+    .hint_border       = "rgba(255,255,255,0.6)",
+    .hint_font_size    = 11,
+    .hint_border_radius = 4,
+    .scroll_speed      = 1,
+    .page_speed        = 10,
+    .jump_speed        = 200,
+};
+
+static void cfg_set(const char *key, const char *val) {
+    if (strcmp(key, "hint_bg") == 0) strncpy(cfg.hint_bg, val, sizeof(cfg.hint_bg) - 1);
+    else if (strcmp(key, "hint_fg") == 0) strncpy(cfg.hint_fg, val, sizeof(cfg.hint_fg) - 1);
+    else if (strcmp(key, "hint_fg_dim") == 0) strncpy(cfg.hint_fg_dim, val, sizeof(cfg.hint_fg_dim) - 1);
+    else if (strcmp(key, "hint_border") == 0) strncpy(cfg.hint_border, val, sizeof(cfg.hint_border) - 1);
+    else if (strcmp(key, "hint_font_size") == 0) cfg.hint_font_size = atoi(val);
+    else if (strcmp(key, "hint_border_radius") == 0) cfg.hint_border_radius = atoi(val);
+    else if (strcmp(key, "scroll_speed") == 0) cfg.scroll_speed = atoi(val);
+    else if (strcmp(key, "page_speed") == 0) cfg.page_speed = atoi(val);
+    else if (strcmp(key, "jump_speed") == 0) cfg.jump_speed = atoi(val);
+}
+
+static void cfg_load(void) {
+    const char *home = getenv("HOME");
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    char path[512];
+
+    if (xdg)
+        snprintf(path, sizeof(path), "%s/wlim/config", xdg);
+    else if (home)
+        snprintf(path, sizeof(path), "%s/.config/wlim/config", home);
+    else
+        return;
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        /* skip comments and empty lines */
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+
+        /* strip trailing newline */
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+
+        /* split key=value */
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+
+        /* trim key and value */
+        char *key = p;
+        char *val = eq + 1;
+        while (*val == ' ' || *val == '\t') val++;
+        char *kend = eq - 1;
+        while (kend > key && (*kend == ' ' || *kend == '\t')) *kend-- = '\0';
+
+        cfg_set(key, val);
+    }
+    fclose(f);
+    fprintf(stderr, "[wlim] loaded config from %s\n", path);
+}
+
 /* lookup table for clickable roles */
 static gboolean clickable_lut[256];
 
@@ -780,7 +862,7 @@ static int scroll_main(void) {
         if (awaiting_g) {
             awaiting_g = 0;
             if (ev.code == KEY_G) {
-                for (int i = 0; i < 200; i++) do_scroll(ufd, -1, 0);
+                for (int i = 0; i < cfg.jump_speed; i++) do_scroll(ufd, -1, 0);
                 continue;
             }
             /* not g — fall through */
@@ -792,29 +874,29 @@ static int scroll_main(void) {
                 break;
             case KEY_J:
             case KEY_DOWN:
-                do_scroll(ufd, 1, 0);
+                for (int i = 0; i < cfg.scroll_speed; i++) do_scroll(ufd, 1, 0);
                 break;
             case KEY_K:
             case KEY_UP:
-                do_scroll(ufd, -1, 0);
+                for (int i = 0; i < cfg.scroll_speed; i++) do_scroll(ufd, -1, 0);
                 break;
             case KEY_H:
             case KEY_LEFT:
-                do_scroll(ufd, 0, 1);
+                for (int i = 0; i < cfg.scroll_speed; i++) do_scroll(ufd, 0, 1);
                 break;
             case KEY_L:
             case KEY_RIGHT:
-                do_scroll(ufd, 0, -1);
+                for (int i = 0; i < cfg.scroll_speed; i++) do_scroll(ufd, 0, -1);
                 break;
             case KEY_D:
-                for (int i = 0; i < 10; i++) do_scroll(ufd, 1, 0);
+                for (int i = 0; i < cfg.page_speed; i++) do_scroll(ufd, 1, 0);
                 break;
             case KEY_U:
-                for (int i = 0; i < 10; i++) do_scroll(ufd, -1, 0);
+                for (int i = 0; i < cfg.page_speed; i++) do_scroll(ufd, -1, 0);
                 break;
             case KEY_G:
                 if (shift_held) {
-                    for (int i = 0; i < 200; i++) do_scroll(ufd, 1, 0);
+                    for (int i = 0; i < cfg.jump_speed; i++) do_scroll(ufd, 1, 0);
                 } else {
                     awaiting_g = 1;
                 }
@@ -895,9 +977,10 @@ static void update_hints(State *s) {
             char mk[128], matched[MAX_LABEL+1] = {0};
             strncpy(matched, l, s->typed_len);
             snprintf(mk, sizeof(mk),
-                "<span foreground=\"#666\">%s</span>"
-                "<span foreground=\"#e0e0e0\">%s</span>",
-                matched, l + s->typed_len);
+                "<span foreground=\"%s\">%s</span>"
+                "<span foreground=\"%s\">%s</span>",
+                cfg.hint_fg_dim, matched,
+                cfg.hint_fg, l + s->typed_len);
             gtk_label_set_markup(GTK_LABEL(s->hint_labels[i]), mk);
         } else {
             gtk_widget_set_visible(s->hint_labels[i], FALSE);
@@ -1008,28 +1091,32 @@ static void on_activate(GtkApplication *app, gpointer data) {
     gtk_layer_set_anchor(GTK_WINDOW(win), GTK_LAYER_SHELL_EDGE_RIGHT, TRUE);
 
     GtkCssProvider *css = gtk_css_provider_new();
-    gtk_css_provider_load_from_string(css,
+    char cssbuf[1024];
+    snprintf(cssbuf, sizeof(cssbuf),
         "window { background: rgba(0,0,0,0.01); }\n"
         ".hint-label {\n"
-        "  background: #2a2a2a;\n"
-        "  color: #e0e0e0;\n"
-        "  font-size: 11px;\n"
+        "  background: %s;\n"
+        "  color: %s;\n"
+        "  font-size: %dpx;\n"
         "  font-weight: bold;\n"
         "  font-family: monospace;\n"
         "  padding: 1px 6px;\n"
-        "  border-radius: 4px;\n"
-        "  border: 1px solid rgba(255,255,255,0.6);\n"
+        "  border-radius: %dpx;\n"
+        "  border: 1px solid %s;\n"
         "}\n"
         ".search-box {\n"
         "  background: #1a1a1a;\n"
-        "  color: #e0e0e0;\n"
+        "  color: %s;\n"
         "  font-size: 14px;\n"
         "  font-family: monospace;\n"
         "  padding: 6px 14px;\n"
         "  border-radius: 6px;\n"
         "  border: 1px solid #444;\n"
         "  margin-bottom: 40px;\n"
-        "}\n");
+        "}\n",
+        cfg.hint_bg, cfg.hint_fg, cfg.hint_font_size,
+        cfg.hint_border_radius, cfg.hint_border, cfg.hint_fg);
+    gtk_css_provider_load_from_string(css, cssbuf);
     gtk_style_context_add_provider_for_display(
         gdk_display_get_default(), GTK_STYLE_PROVIDER(css),
         GTK_STYLE_PROVIDER_PRIORITY_USER);
@@ -1077,6 +1164,8 @@ static void on_shutdown(GtkApplication *app, gpointer data) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[]) {
+    cfg_load();
+
     /* check for flags */
     gboolean scroll_mode = FALSE;
     for (int i = 1; i < argc; i++) {
