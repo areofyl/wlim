@@ -595,7 +595,229 @@ static void do_click(int x, int y) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  overlay                                                            */
+/*  scroll mode — evdev keyboard grab + uinput scroll                  */
+/* ------------------------------------------------------------------ */
+
+#include <signal.h>
+#include <dirent.h>
+#include <linux/input.h>
+
+static volatile sig_atomic_t scroll_quit = 0;
+static int scroll_kbd_fd = -1;  /* for signal handler cleanup */
+
+static void scroll_sighandler(int sig) {
+    (void)sig;
+    /* release keyboard grab so user isn't stuck */
+    if (scroll_kbd_fd >= 0) ioctl(scroll_kbd_fd, EVIOCGRAB, 0);
+    scroll_quit = 1;
+}
+
+/* find the primary keyboard evdev device */
+#define BITS_PER_LONG (sizeof(unsigned long) * 8)
+#define NBITS(x) (((x) + BITS_PER_LONG - 1) / BITS_PER_LONG)
+#define TEST_BIT(bit, arr) ((arr[(bit) / BITS_PER_LONG] >> ((bit) % BITS_PER_LONG)) & 1)
+
+static int find_keyboard(void) {
+    DIR *d = opendir("/dev/input");
+    if (!d) return -1;
+
+    struct dirent *ent;
+    int best_fd = -1;
+
+    while ((ent = readdir(d)) != NULL) {
+        if (strncmp(ent->d_name, "event", 5) != 0) continue;
+
+        char path[128];
+        snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+
+        /* check if this device has EV_KEY */
+        unsigned long evbits[NBITS(EV_MAX + 1)] = {0};
+        ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits);
+
+        if (!TEST_BIT(EV_KEY, evbits)) {
+            close(fd); continue;
+        }
+
+        /* check for real keyboard keys */
+        unsigned long keybits[NBITS(KEY_MAX + 1)] = {0};
+        ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybits)), keybits);
+
+        if (TEST_BIT(KEY_A, keybits) && TEST_BIT(KEY_J, keybits) &&
+            TEST_BIT(KEY_ESC, keybits)) {
+            /* skip our own virtual devices */
+            char name[256] = {0};
+            ioctl(fd, EVIOCGNAME(sizeof(name)), name);
+            if (strstr(name, "wlim")) { close(fd); continue; }
+
+            if (best_fd >= 0) close(best_fd);
+            best_fd = fd;
+            fprintf(stderr, "[wlim] using keyboard: %s (%s)\n", path, name);
+        } else {
+            close(fd);
+        }
+    }
+    closedir(d);
+    return best_fd;
+}
+
+static int scroll_uinput_create(void) {
+    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        fprintf(stderr, "[wlim] cannot open /dev/uinput: %s\n", strerror(errno));
+        return -1;
+    }
+
+    ioctl(fd, UI_SET_EVBIT, EV_REL);
+    ioctl(fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(fd, UI_SET_EVBIT, EV_SYN);
+    ioctl(fd, UI_SET_RELBIT, REL_X);
+    ioctl(fd, UI_SET_RELBIT, REL_Y);
+    ioctl(fd, UI_SET_RELBIT, REL_WHEEL);
+    ioctl(fd, UI_SET_RELBIT, REL_HWHEEL);
+    ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);
+    ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT);
+
+    struct uinput_setup setup = {0};
+    snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "wlim-scroll");
+    setup.id.bustype = BUS_VIRTUAL;
+    setup.id.vendor  = 0x1234;
+    setup.id.product = 0x5679;
+    setup.id.version = 1;
+    ioctl(fd, UI_DEV_SETUP, &setup);
+    ioctl(fd, UI_DEV_CREATE);
+    usleep(100000);
+    return fd;
+}
+
+static void do_scroll(int fd, int vert, int horiz) {
+    if (fd < 0) return;
+    if (vert)  emit(fd, EV_REL, REL_WHEEL, vert);
+    if (horiz) emit(fd, EV_REL, REL_HWHEEL, horiz);
+    emit(fd, EV_SYN, SYN_REPORT, 0);
+}
+
+static int scroll_main(void) {
+    int kbd = find_keyboard();
+    if (kbd < 0) {
+        fprintf(stderr, "[wlim] no keyboard found\n");
+        system("notify-send -t 3000 wlim 'no keyboard found'");
+        return 1;
+    }
+
+    int ufd = scroll_uinput_create();
+    if (ufd < 0) { close(kbd); return 1; }
+
+    /* wait for all modifier keys to be released before grabbing,
+     * so the compositor sees the releases from the launch keybind */
+    {
+        static const int mods[] = {
+            KEY_LEFTSHIFT, KEY_RIGHTSHIFT,
+            KEY_LEFTCTRL, KEY_RIGHTCTRL,
+            KEY_LEFTALT, KEY_RIGHTALT,
+            KEY_LEFTMETA, KEY_RIGHTMETA,
+        };
+        for (int tries = 0; tries < 100; tries++) {
+            unsigned long ks[NBITS(KEY_MAX + 1)] = {0};
+            ioctl(kbd, EVIOCGKEY(sizeof(ks)), ks);
+            int any = 0;
+            for (size_t i = 0; i < sizeof(mods)/sizeof(mods[0]); i++)
+                if (TEST_BIT(mods[i], ks)) { any = 1; break; }
+            if (!any) break;
+            usleep(10000);  /* 10ms */
+        }
+    }
+
+    /* grab keyboard exclusively — all keys come to us */
+    if (ioctl(kbd, EVIOCGRAB, 1) < 0) {
+        fprintf(stderr, "[wlim] EVIOCGRAB failed: %s\n", strerror(errno));
+        close(kbd);
+        ioctl(ufd, UI_DEV_DESTROY); close(ufd);
+        return 1;
+    }
+
+    scroll_kbd_fd = kbd;
+    signal(SIGTERM, scroll_sighandler);
+    signal(SIGINT, scroll_sighandler);
+
+    fprintf(stderr, "[wlim] scroll mode active (Escape to exit)\n");
+
+    int shift_held = 0;
+    int awaiting_g = 0;
+    struct input_event ev;
+
+    while (!scroll_quit) {
+        ssize_t n = read(kbd, &ev, sizeof(ev));
+        if (n != sizeof(ev)) break;
+        if (ev.type != EV_KEY) continue;
+
+        /* track shift state */
+        if (ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT) {
+            shift_held = (ev.value != 0);  /* 1=press, 2=repeat, 0=release */
+            continue;
+        }
+
+        /* only act on press (1) and repeat (2), not release (0) */
+        if (ev.value == 0) continue;
+
+        /* gg sequence */
+        if (awaiting_g) {
+            awaiting_g = 0;
+            if (ev.code == KEY_G) {
+                for (int i = 0; i < 200; i++) do_scroll(ufd, -1, 0);
+                continue;
+            }
+            /* not g — fall through */
+        }
+
+        switch (ev.code) {
+            case KEY_ESC:
+                scroll_quit = 1;
+                break;
+            case KEY_J:
+            case KEY_DOWN:
+                do_scroll(ufd, 1, 0);
+                break;
+            case KEY_K:
+            case KEY_UP:
+                do_scroll(ufd, -1, 0);
+                break;
+            case KEY_H:
+            case KEY_LEFT:
+                do_scroll(ufd, 0, 1);
+                break;
+            case KEY_L:
+            case KEY_RIGHT:
+                do_scroll(ufd, 0, -1);
+                break;
+            case KEY_D:
+                for (int i = 0; i < 10; i++) do_scroll(ufd, 1, 0);
+                break;
+            case KEY_U:
+                for (int i = 0; i < 10; i++) do_scroll(ufd, -1, 0);
+                break;
+            case KEY_G:
+                if (shift_held) {
+                    for (int i = 0; i < 200; i++) do_scroll(ufd, 1, 0);
+                } else {
+                    awaiting_g = 1;
+                }
+                break;
+        }
+    }
+
+    ioctl(kbd, EVIOCGRAB, 0);  /* release grab */
+    close(kbd);
+    ioctl(ufd, UI_DEV_DESTROY);
+    close(ufd);
+    scroll_kbd_fd = -1;
+    fprintf(stderr, "[wlim] scroll mode exited\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  hint mode — overlay                                                */
 /* ------------------------------------------------------------------ */
 
 static void update_hints(State *s) {
@@ -724,10 +946,18 @@ static void on_shutdown(GtkApplication *app, gpointer data) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[]) {
+    /* check for --scroll mode */
+    gboolean scroll_mode = FALSE;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--scroll") == 0) scroll_mode = TRUE;
+    }
+
+    if (scroll_mode) return scroll_main();
+
+    /* hint mode */
     init_clickable_lut();
     atspi_init();
 
-    /* fetch all hyprland client geometries in one call */
     char *clients_json = hyprctl_request("j/clients");
 
     State st = {0};
