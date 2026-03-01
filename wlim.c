@@ -72,7 +72,7 @@ typedef struct {
     int     click_x, click_y;
     int     click_button;  /* BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, or 0 (hover) */
     gboolean should_click;
-    gboolean tab_held;
+    gboolean hover_mode;
 } State;
 
 /* ------------------------------------------------------------------ */
@@ -858,9 +858,8 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         if (s->typed_len > 0) { s->typed[--s->typed_len] = '\0'; update_hints(s); }
         return TRUE;
     }
-
-    if (g_strcmp0(kn, "Tab") == 0 || g_strcmp0(kn, "ISO_Left_Tab") == 0) {
-        s->tab_held = TRUE;
+    if (g_strcmp0(kn, "period") == 0) {
+        s->hover_mode = !s->hover_mode;
         return TRUE;
     }
 
@@ -880,7 +879,7 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         s->should_click = TRUE;
         s->click_x = s->targets[mi].cx;
         s->click_y = s->targets[mi].cy;
-        s->click_button = s->tab_held ? 0  /* hover only */
+        s->click_button = s->hover_mode ? 0  /* hover only */
                         : (mod & GDK_SHIFT_MASK) ? BTN_RIGHT
                         : (mod & GDK_CONTROL_MASK) ? BTN_MIDDLE
                         : BTN_LEFT;
@@ -894,15 +893,6 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
     if (!any) { s->typed_len = 0; s->typed[0] = '\0'; update_hints(s); }
 
     return TRUE;
-}
-
-static void on_key_released(GtkEventControllerKey *ctrl, guint keyval,
-                             guint keycode, GdkModifierType mod, gpointer data)
-{
-    State *s = data;
-    const char *kn = gdk_keyval_name(keyval);
-    if (g_strcmp0(kn, "Tab") == 0 || g_strcmp0(kn, "ISO_Left_Tab") == 0)
-        s->tab_held = FALSE;
 }
 
 static void on_activate(GtkApplication *app, gpointer data) {
@@ -953,7 +943,6 @@ static void on_activate(GtkApplication *app, gpointer data) {
     GtkEventController *kc = gtk_event_controller_key_new();
     gtk_event_controller_set_propagation_phase(kc, GTK_PHASE_CAPTURE);
     g_signal_connect(kc, "key-pressed", G_CALLBACK(on_key), s);
-    g_signal_connect(kc, "key-released", G_CALLBACK(on_key_released), s);
     gtk_widget_add_controller(win, kc);
     gtk_window_present(GTK_WINDOW(win));
 }
