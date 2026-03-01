@@ -872,7 +872,9 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         s->should_click = TRUE;
         s->click_x = s->targets[mi].cx;
         s->click_y = s->targets[mi].cy;
-        s->click_button = (mod & GDK_SHIFT_MASK) ? BTN_RIGHT : BTN_LEFT;
+        s->click_button = (mod & GDK_SHIFT_MASK) ? BTN_RIGHT
+                        : (mod & GDK_CONTROL_MASK) ? BTN_MIDDLE
+                        : BTN_LEFT;
         gtk_window_destroy(GTK_WINDOW(s->win));
         return TRUE;
     }
