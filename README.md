@@ -11,6 +11,7 @@ vimium-like click hints for wayland. press a keybind, get letter labels on every
 3. draws a fullscreen transparent overlay using GTK4 + gtk4-layer-shell
 4. shows letter labels at each element's position
 5. you type the letters, overlay closes, uinput clicks that spot
+6. hold shift while typing the last letter to right-click instead
 
 ## dependencies
 
@@ -22,7 +23,7 @@ vimium-like click hints for wayland. press a keybind, get letter labels on every
 
 on fedora:
 ```
-sudo dnf install gtk4-devel gtk4-layer-shell-devel at-spi2-core-devel ydotool
+sudo dnf install gtk4-devel gtk4-layer-shell-devel at-spi2-core-devel
 ```
 
 ## build
@@ -55,10 +56,27 @@ or set the flatpak env if you're using flatpak chromium:
 flatpak override --user --env=ACCESSIBILITY_ENABLED=1 io.github.nickvision.chromium
 ```
 
-**hyprland keybind** — add to your hyprland config:
+**hyprland keybinds** — add to your hyprland config:
 ```
 bind = $mainMod, semicolon, exec, /path/to/wlim
+bind = $mainMod SHIFT, semicolon, exec, /path/to/wlim --scroll
 ```
+
+## scroll mode
+
+`wlim --scroll` gives you vim-style keyboard scrolling. it grabs the keyboard and emits scroll events via uinput.
+
+| key | action |
+|-----|--------|
+| `j` / `Down` | scroll down |
+| `k` / `Up` | scroll up |
+| `h` / `Left` | scroll left |
+| `l` / `Right` | scroll right |
+| `d` | half-page down |
+| `u` | half-page up |
+| `G` | jump to bottom |
+| `gg` | jump to top |
+| `Escape` | exit scroll mode |
 
 ## known issues / caveats
 
