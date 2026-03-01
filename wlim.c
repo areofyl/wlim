@@ -76,6 +76,7 @@ typedef struct {
     gboolean search_mode;
     char    search[64];
     int     search_len;
+    GtkWidget *search_box;
 } State;
 
 /* ------------------------------------------------------------------ */
@@ -845,6 +846,12 @@ static gboolean strcasestr_match(const char *hay, const char *needle) {
     return FALSE;
 }
 
+static void update_search_box(State *s) {
+    char buf[80];
+    snprintf(buf, sizeof(buf), "/ %s", s->search);
+    gtk_label_set_text(GTK_LABEL(s->search_box), buf);
+}
+
 static void apply_search_filter(State *s) {
     /* hide hints that don't match search, show those that do */
     int visible = 0;
@@ -915,6 +922,8 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         s->search_mode = TRUE;
         s->search_len = 0;
         s->search[0] = '\0';
+        gtk_widget_set_visible(s->search_box, TRUE);
+        update_search_box(s);
         return TRUE;
     }
 
@@ -922,6 +931,7 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
     if (s->search_mode) {
         if (g_strcmp0(kn, "Return") == 0) {
             s->search_mode = FALSE;
+            gtk_widget_set_visible(s->search_box, FALSE);
             relabel_visible(s);
             s->typed_len = 0;
             s->typed[0] = '\0';
@@ -931,6 +941,7 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
             if (s->search_len > 0) {
                 s->search[--s->search_len] = '\0';
                 apply_search_filter(s);
+                update_search_box(s);
             }
             return TRUE;
         }
@@ -940,6 +951,7 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
             s->search[s->search_len++] = sch;
             s->search[s->search_len] = '\0';
             apply_search_filter(s);
+            update_search_box(s);
         }
         return TRUE;
     }
@@ -1007,14 +1019,27 @@ static void on_activate(GtkApplication *app, gpointer data) {
         "  padding: 1px 6px;\n"
         "  border-radius: 4px;\n"
         "  border: 1px solid #444;\n"
+        "}\n"
+        ".search-box {\n"
+        "  background: #1a1a1a;\n"
+        "  color: #e0e0e0;\n"
+        "  font-size: 14px;\n"
+        "  font-family: monospace;\n"
+        "  padding: 6px 14px;\n"
+        "  border-radius: 6px;\n"
+        "  border: 1px solid #444;\n"
+        "  margin-bottom: 40px;\n"
         "}\n");
     gtk_style_context_add_provider_for_display(
         gdk_display_get_default(), GTK_STYLE_PROVIDER(css),
         GTK_STYLE_PROVIDER_PRIORITY_USER);
     g_object_unref(css);
 
+    GtkWidget *overlay = gtk_overlay_new();
+    gtk_window_set_child(GTK_WINDOW(win), overlay);
+
     GtkWidget *fixed = gtk_fixed_new();
-    gtk_window_set_child(GTK_WINDOW(win), fixed);
+    gtk_overlay_set_child(GTK_OVERLAY(overlay), fixed);
     s->fixed = fixed;
 
     for (int i = 0; i < s->n_targets; i++) {
@@ -1023,6 +1048,15 @@ static void on_activate(GtkApplication *app, gpointer data) {
         gtk_fixed_put(GTK_FIXED(fixed), lbl, s->targets[i].lx, s->targets[i].ly);
         s->hint_labels[i] = lbl;
     }
+
+    /* search box — centered at bottom, hidden by default */
+    GtkWidget *search_box = gtk_label_new("/ ");
+    gtk_widget_add_css_class(search_box, "search-box");
+    gtk_widget_set_halign(search_box, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(search_box, GTK_ALIGN_END);
+    gtk_widget_set_visible(search_box, FALSE);
+    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), search_box);
+    s->search_box = search_box;
 
     GtkEventController *kc = gtk_event_controller_key_new();
     g_signal_connect(kc, "key-pressed", G_CALLBACK(on_key), s);
