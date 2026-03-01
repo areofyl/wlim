@@ -13,7 +13,7 @@ vimium-like click hints for wayland. press a keybind, get letter labels on every
 5. you type the letters, overlay closes, uinput clicks that spot
 6. hold shift while typing the last letter to right-click instead
 7. hold ctrl while typing the last letter to middle-click instead
-8. press `.` to toggle hover mode, then type a hint to move cursor without clicking
+
 
 ## dependencies
 
