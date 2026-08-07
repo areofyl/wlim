@@ -1,10 +1,10 @@
 /*
- * wlim — vimium-like click hints for wayland (hyprland)
+ * wlim — vimium-like click hints for wayland
  *
  * walks the AT-SPI2 accessibility tree of all visible windows,
  * draws labeled hints over every clickable element using a
  * GTK4 + gtk4-layer-shell overlay, and clicks via uinput
- * when you type a hint.
+ * when you type a hint. works on any wlroots-based compositor.
  *
  * build:
  *   make
@@ -21,8 +21,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <errno.h>
@@ -161,211 +159,6 @@ typedef struct {
     GtkWidget *search_box;
 } State;
 
-/* ------------------------------------------------------------------ */
-/*  hyprctl — direct socket                                            */
-/* ------------------------------------------------------------------ */
-
-static char *hyprctl_request(const char *request) {
-    const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
-    if (!his) return NULL;
-
-    char path[256];
-    snprintf(path, sizeof(path), "/tmp/hypr/%s/.socket.sock", his);
-
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return NULL;
-
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        const char *xrd = getenv("XDG_RUNTIME_DIR");
-        if (xrd) {
-            snprintf(path, sizeof(path), "%s/hypr/%s/.socket.sock", xrd, his);
-            strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-            if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-                close(fd);
-                return NULL;
-            }
-        } else {
-            close(fd);
-            return NULL;
-        }
-    }
-
-    size_t rlen = strlen(request);
-    if (write(fd, request, rlen) != (ssize_t)rlen) {
-        close(fd);
-        return NULL;
-    }
-
-    size_t cap = 8192, len = 0;
-    char *buf = malloc(cap);
-    while (1) {
-        ssize_t n = read(fd, buf + len, cap - len - 1);
-        if (n <= 0) break;
-        len += n;
-        if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
-    }
-    buf[len] = '\0';
-    close(fd);
-    return buf;
-}
-
-/* ------------------------------------------------------------------ */
-/*  json helpers                                                       */
-/* ------------------------------------------------------------------ */
-
-static int json_int(const char *j, const char *key, int def) {
-    char pat[128];
-    snprintf(pat, sizeof(pat), "\"%s\":", key);
-    const char *p = strstr(j, pat);
-    if (!p) return def;
-    p += strlen(pat);
-    while (*p == ' ' || *p == '\t') p++;
-    return atoi(p);
-}
-
-static char *json_str(const char *j, const char *key, char *buf, size_t sz) {
-    char pat[128];
-    snprintf(pat, sizeof(pat), "\"%s\":", key);
-    const char *p = strstr(j, pat);
-    buf[0] = '\0';
-    if (!p) return buf;
-    p += strlen(pat);
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p != '"') return buf;
-    p++;
-    size_t i = 0;
-    while (*p && *p != '"' && i < sz - 1) {
-        if (*p == '\\' && *(p + 1)) {
-            p++;
-            switch (*p) {
-                case '"': case '\\': case '/': buf[i++] = *p; break;
-                case 'n': buf[i++] = '\n'; break;
-                case 't': buf[i++] = '\t'; break;
-                default:  buf[i++] = *p; break;
-            }
-            p++;
-        } else {
-            buf[i++] = *p++;
-        }
-    }
-    buf[i] = '\0';
-    return buf;
-}
-
-static void json_int_pair(const char *j, const char *key, int *a, int *b) {
-    char pat[128];
-    snprintf(pat, sizeof(pat), "\"%s\":", key);
-    const char *p = strstr(j, pat);
-    if (!p) { *a = 0; *b = 0; return; }
-    p += strlen(pat);
-    while (*p && *p != '[') p++;
-    if (*p == '[') p++;
-    *a = atoi(p);
-    while (*p && *p != ',') p++;
-    if (*p == ',') p++;
-    *b = atoi(p);
-}
-
-/* ------------------------------------------------------------------ */
-/*  hyprctl client geometry lookup                                     */
-/* ------------------------------------------------------------------ */
-
-/* find the matching '}' for a '{', handling nested braces */
-static const char *find_block_end(const char *p) {
-    int depth = 0;
-    gboolean in_str = FALSE;
-    for (; *p; p++) {
-        if (*p == '\\' && in_str) { p++; continue; }
-        if (*p == '"') { in_str = !in_str; continue; }
-        if (in_str) continue;
-        if (*p == '{') depth++;
-        else if (*p == '}') { depth--; if (depth == 0) return p; }
-    }
-    return NULL;
-}
-
-/* find the geometry of a hyprland client by matching its pid against
- * the clients json array. returns false if not found. */
-static gboolean find_client_geom(const char *clients_json, int pid,
-                                  int *cx, int *cy, int *cw, int *ch)
-{
-    if (!clients_json || pid <= 0) return FALSE;
-
-    const char *p = clients_json;
-    while ((p = strchr(p, '{')) != NULL) {
-        const char *end = find_block_end(p);
-        if (!end) break;
-
-        size_t blen = end - p + 1;
-        char *block = malloc(blen + 1);
-        memcpy(block, p, blen);
-        block[blen] = '\0';
-
-        int cpid = json_int(block, "pid", -1);
-        if (cpid == pid) {
-            json_int_pair(block, "at", cx, cy);
-            json_int_pair(block, "size", cw, ch);
-            free(block);
-            return TRUE;
-        }
-        free(block);
-        p = end + 1;
-    }
-    return FALSE;
-}
-
-/* check if two titles share a long enough common substring to be
- * considered the same window (handles " - Audio playing" etc) */
-static gboolean titles_match(const char *a, const char *b) {
-    if (!a[0] || !b[0]) return FALSE;
-    if (strstr(a, b) || strstr(b, a)) return TRUE;
-    /* check if one title starts with the other's first N chars.
-     * chromium titles differ by suffixes like " - Audio playing" */
-    size_t la = strlen(a), lb = strlen(b);
-    size_t min = la < lb ? la : lb;
-    if (min > 10 && strncmp(a, b, min) == 0) return TRUE;
-    /* check shared prefix of at least 20 chars */
-    size_t common = 0;
-    while (common < la && common < lb && a[common] == b[common]) common++;
-    if (common >= 20) return TRUE;
-    return FALSE;
-}
-
-/* find client geometry by matching AT-SPI window title against
- * hyprctl client titles */
-static gboolean find_client_geom_by_title(const char *clients_json,
-                                            const char *title,
-                                            int *cx, int *cy, int *cw, int *ch)
-{
-    if (!clients_json || !title || !title[0]) return FALSE;
-
-    const char *p = clients_json;
-    while ((p = strchr(p, '{')) != NULL) {
-        const char *end = find_block_end(p);
-        if (!end) break;
-
-        size_t blen = end - p + 1;
-        char *block = malloc(blen + 1);
-        memcpy(block, p, blen);
-        block[blen] = '\0';
-
-        char ctitle[256];
-        json_str(block, "title", ctitle, sizeof(ctitle));
-
-        if (titles_match(ctitle, title)) {
-            json_int_pair(block, "at", cx, cy);
-            json_int_pair(block, "size", cw, ch);
-            free(block);
-            return TRUE;
-        }
-        free(block);
-        p = end + 1;
-    }
-    return FALSE;
-}
 
 /* ------------------------------------------------------------------ */
 /*  label generation                                                   */
@@ -458,9 +251,23 @@ kids:;
     }
 }
 
+/* read focused window geometry exported by dwl */
+static gboolean read_active_geom(int *wx, int *wy, int *ww, int *wh) {
+    FILE *f = fopen("/tmp/dwl-active-geom", "r");
+    if (!f) return FALSE;
+    int ok = fscanf(f, "%d %d %d %d", wx, wy, ww, wh) == 4;
+    fclose(f);
+    return ok;
+}
+
 /* walk all AT-SPI apps/windows, collecting targets from every one.
- * for windows with broken coords (GTK4), use grid_fallback per window. */
-static void collect_all_targets(State *st, const char *clients_json) {
+ * uses dwl's exported geometry to fix window-relative coords. */
+static void collect_all_targets(State *st) {
+    int wx = 0, wy = 0, ww = 0, wh = 0;
+    gboolean have_geom = read_active_geom(&wx, &wy, &ww, &wh);
+    if (have_geom)
+        fprintf(stderr, "[wlim] dwl active window: (%d,%d %dx%d)\n", wx, wy, ww, wh);
+
     AtspiAccessible *desktop = atspi_get_desktop(0);
     int napps = atspi_accessible_get_child_count(desktop, NULL);
 
@@ -469,46 +276,26 @@ static void collect_all_targets(State *st, const char *clients_json) {
         if (!app) continue;
 
         int nwins = atspi_accessible_get_child_count(app, NULL);
-        guint app_pid = atspi_accessible_get_process_id(app, NULL);
 
         for (int k = 0; k < nwins && st->n_targets < MAX_TARGETS; k++) {
             AtspiAccessible *w = atspi_accessible_get_child_at_index(app, k, NULL);
             if (!w) continue;
 
-            /* remember where this window's targets start */
             int start = st->n_targets;
-
             walk(w, st->targets, &st->n_targets, 0);
-
             int count = st->n_targets - start;
+
             if (count > 0) {
-                /* look up this window's actual geometry from hyprctl */
-                int wx = 0, wy = 0, ww = 0, wh = 0;
-                gboolean found = find_client_geom(clients_json,
-                                                   (int)app_pid,
-                                                   &wx, &wy, &ww, &wh);
-                if (!found) {
-                    gchar *wtitle = atspi_accessible_get_name(w, NULL);
-                    if (wtitle) {
-                        found = find_client_geom_by_title(clients_json,
-                                    wtitle, &wx, &wy, &ww, &wh);
-                        g_free(wtitle);
-                    }
-                }
-
                 gchar *dbg_name = atspi_accessible_get_name(w, NULL);
-                fprintf(stderr, "[wlim] window \"%s\": %d targets, geom found=%d at=(%d,%d) size=(%d,%d) pid_atspi=%d\n",
-                        dbg_name ? dbg_name : "?", count, found, wx, wy, ww, wh, (int)app_pid);
-                if (dbg_name) g_free(dbg_name);
 
-                /* check if this window's coords are usable */
+                /* check if coords are broken (GTK4 reports all zeros) */
                 int zeros = 0;
                 for (int t = start; t < st->n_targets; t++)
                     if (st->targets[t].x == 0 && st->targets[t].y == 0) zeros++;
 
                 if ((double)zeros / count >= 0.8) {
-                    /* broken coords (GTK4) — distribute in a grid */
-                    if (found && ww > 0 && wh > 0) {
+                    /* broken coords — use dwl geometry for grid fallback */
+                    if (have_geom && ww > 0 && wh > 0) {
                         int m = 30;
                         int gx = wx + m, gy = wy + m;
                         int gw = ww - m*2, gh = wh - m*2;
@@ -524,17 +311,19 @@ static void collect_all_targets(State *st, const char *clients_json) {
                             st->targets[start + t].cx = px;
                             st->targets[start + t].cy = py;
                         }
+                        fprintf(stderr, "[wlim] window \"%s\": %d targets, grid fallback over (%d,%d %dx%d)\n",
+                                dbg_name ? dbg_name : "?", count, wx, wy, ww, wh);
                     } else {
+                        fprintf(stderr, "[wlim] window \"%s\": %d targets with broken coords, skipping\n",
+                                dbg_name ? dbg_name : "?", count);
                         st->n_targets = start;
                     }
                 } else {
-                    /* coords are present — check if they're window-relative.
-                     * on wayland, some apps (chromium) report AT-SPI coords
-                     * relative to the window instead of the screen. detect
-                     * this by checking if all coords fall within [0, ww) x
-                     * [0, wh) rather than [wx, wx+ww) x [wy, wy+wh). */
+                    /* detect window-relative coords: if most elements fit
+                     * inside [0,ww)x[0,wh) and the window isn't at (0,0),
+                     * apply the window position as offset */
                     int off_x = 0, off_y = 0;
-                    if (found && ww > 0 && wh > 0 && (wx > 0 || wy > 0)) {
+                    if (have_geom && ww > 0 && wh > 0 && (wx > 0 || wy > 0)) {
                         int window_rel = 0;
                         for (int t = start; t < st->n_targets; t++) {
                             Target *tg = &st->targets[t];
@@ -542,16 +331,14 @@ static void collect_all_targets(State *st, const char *clients_json) {
                                 tg->y >= 0 && tg->y < wh)
                                 window_rel++;
                         }
-                        /* if most coords fit inside [0,ww)x[0,wh) but the
-                         * window isn't at (0,0), they're window-relative */
-                        fprintf(stderr, "[wlim]   window_rel=%d/%d (%.0f%%)\n",
-                                window_rel, count, 100.0 * window_rel / count);
                         if ((double)window_rel / count >= 0.8) {
                             off_x = wx;
                             off_y = wy;
-                            fprintf(stderr, "[wlim]   applying offset (%d,%d)\n", off_x, off_y);
                         }
                     }
+
+                    fprintf(stderr, "[wlim] window \"%s\": %d targets, offset=(%d,%d)\n",
+                            dbg_name ? dbg_name : "?", count, off_x, off_y);
 
                     for (int t = start; t < st->n_targets; t++) {
                         Target *tg = &st->targets[t];
@@ -561,8 +348,8 @@ static void collect_all_targets(State *st, const char *clients_json) {
                         tg->ly = tg->y + off_y + 8;
                     }
                 }
+                if (dbg_name) g_free(dbg_name);
             }
-
             g_object_unref(w);
         }
         g_object_unref(app);
@@ -573,40 +360,11 @@ static void collect_all_targets(State *st, const char *clients_json) {
 /*  uinput — direct virtual input device                               */
 /* ------------------------------------------------------------------ */
 
-/* get the total screen bounding box from hyprctl monitors.
- * for multi-monitor setups this returns the combined extent. */
+static int cached_sw = 1920, cached_sh = 1080;
+
 static void get_screen_bounds(int *total_w, int *total_h) {
-    char *json = hyprctl_request("j/monitors");
-    *total_w = 1920;
-    *total_h = 1080;
-    if (!json) return;
-
-    int max_x = 0, max_y = 0;
-    const char *p = json;
-    while ((p = strchr(p, '{')) != NULL) {
-        const char *end = find_block_end(p);
-        if (!end) break;
-
-        size_t blen = end - p + 1;
-        char *block = malloc(blen + 1);
-        memcpy(block, p, blen);
-        block[blen] = '\0';
-
-        int mx = json_int(block, "x", 0);
-        int my = json_int(block, "y", 0);
-        int mw = json_int(block, "width", 0);
-        int mh = json_int(block, "height", 0);
-
-        if (mx + mw > max_x) max_x = mx + mw;
-        if (my + mh > max_y) max_y = my + mh;
-
-        free(block);
-        p = end + 1;
-    }
-    free(json);
-
-    if (max_x > 0) *total_w = max_x;
-    if (max_y > 0) *total_h = max_y;
+    *total_w = cached_sw;
+    *total_h = cached_sh;
 }
 
 static void emit(int fd, int type, int code, int val) {
@@ -627,13 +385,20 @@ static void do_click(int x, int y, int button) {
         return;
     }
 
-    /* enable event types */
+    /* enable event types — use REL pointer so wlroots treats this as a
+     * regular mouse (ABS-only devices are handled as tablets and don't
+     * trigger wl_pointer.enter on surfaces) */
+    ioctl(fd, UI_SET_EVBIT, EV_REL);
     ioctl(fd, UI_SET_EVBIT, EV_ABS);
     ioctl(fd, UI_SET_EVBIT, EV_KEY);
     ioctl(fd, UI_SET_EVBIT, EV_SYN);
+    ioctl(fd, UI_SET_RELBIT, REL_X);
+    ioctl(fd, UI_SET_RELBIT, REL_Y);
     ioctl(fd, UI_SET_ABSBIT, ABS_X);
     ioctl(fd, UI_SET_ABSBIT, ABS_Y);
-    ioctl(fd, UI_SET_KEYBIT, button);
+    ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);
+    ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT);
+    ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE);
 
     /* configure abs axes to match screen pixel dimensions */
     struct uinput_abs_setup abs_x = {0};
@@ -658,8 +423,8 @@ static void do_click(int x, int y, int button) {
     ioctl(fd, UI_DEV_SETUP, &setup);
     ioctl(fd, UI_DEV_CREATE);
 
-    /* small delay for compositor to register the new device */
-    usleep(50000);
+    /* delay for compositor to register the new device */
+    usleep(100000);
 
     /* clamp coordinates */
     if (x < 0) x = 0;
@@ -670,11 +435,21 @@ static void do_click(int x, int y, int button) {
     const char *bname = button == BTN_RIGHT ? "right" : button == BTN_MIDDLE ? "middle" : "left";
     fprintf(stderr, "[wlim] %s-clicking at (%d,%d) screen=(%dx%d)\n", bname, x, y, sw, sh);
 
-    /* move to position */
+    /* move cursor to position */
     emit(fd, EV_ABS, ABS_X, x);
     emit(fd, EV_ABS, ABS_Y, y);
     emit(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(20000);
+    usleep(50000);
+
+    /* nudge with relative motion to trigger wl_pointer.enter on the surface */
+    emit(fd, EV_REL, REL_X, 1);
+    emit(fd, EV_REL, REL_Y, 0);
+    emit(fd, EV_SYN, SYN_REPORT, 0);
+    usleep(30000);
+    emit(fd, EV_REL, REL_X, -1);
+    emit(fd, EV_REL, REL_Y, 0);
+    emit(fd, EV_SYN, SYN_REPORT, 0);
+    usleep(50000);
 
     /* press */
     emit(fd, EV_KEY, button, 1);
@@ -1145,6 +920,26 @@ static void on_activate(GtkApplication *app, gpointer data) {
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), search_box);
     s->search_box = search_box;
 
+    /* cache screen bounds for uinput click coordinates */
+    {
+        GdkDisplay *disp = gdk_display_get_default();
+        if (disp) {
+            GListModel *mons = gdk_display_get_monitors(disp);
+            guint nmons = g_list_model_get_n_items(mons);
+            int max_x = 0, max_y = 0;
+            for (guint i = 0; i < nmons; i++) {
+                GdkMonitor *mon = g_list_model_get_item(mons, i);
+                GdkRectangle geo;
+                gdk_monitor_get_geometry(mon, &geo);
+                if (geo.x + geo.width > max_x) max_x = geo.x + geo.width;
+                if (geo.y + geo.height > max_y) max_y = geo.y + geo.height;
+                g_object_unref(mon);
+            }
+            if (max_x > 0) cached_sw = max_x;
+            if (max_y > 0) cached_sh = max_y;
+        }
+    }
+
     GtkEventController *kc = gtk_event_controller_key_new();
     g_signal_connect(kc, "key-pressed", G_CALLBACK(on_key), s);
     gtk_widget_add_controller(win, kc);
@@ -1152,11 +947,7 @@ static void on_activate(GtkApplication *app, gpointer data) {
 }
 
 static void on_shutdown(GtkApplication *app, gpointer data) {
-    State *s = data;
-    if (s->should_click) {
-        usleep(150000);
-        do_click(s->click_x, s->click_y, s->click_button);
-    }
+    (void)app; (void)data;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1178,11 +969,8 @@ int main(int argc, char *argv[]) {
     init_clickable_lut();
     atspi_init();
 
-    char *clients_json = hyprctl_request("j/clients");
-
     State st = {0};
-    collect_all_targets(&st, clients_json);
-    free(clients_json);
+    collect_all_targets(&st);
 
     if (st.n_targets == 0) {
         system("notify-send -t 3000 wlim 'no clickable elements found'");
@@ -1196,5 +984,11 @@ int main(int argc, char *argv[]) {
     g_signal_connect(app, "shutdown", G_CALLBACK(on_shutdown), &st);
     g_application_run(G_APPLICATION(app), 0, NULL);
     g_object_unref(app);
+
+    /* click after GTK is fully torn down so the overlay is gone */
+    if (st.should_click) {
+        usleep(200000);
+        do_click(st.click_x, st.click_y, st.click_button);
+    }
     return 0;
 }
