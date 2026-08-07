@@ -1,6 +1,6 @@
 # wlim
 
-vimium-like click hints for wayland. press a keybind, get letter labels on every clickable thing, type a label, click happens. like [homerow](https://www.homerow.app/) but for linux/hyprland.
+vimium-like click hints for wayland. press a keybind, get letter labels on every clickable thing, type a label, click happens. like [homerow](https://www.homerow.app/) but for linux. works on any wlroots-based compositor (dwl, hyprland, sway, etc).
 
 ![concept: yellow hint labels over browser UI elements](https://img.shields.io/badge/status-works%20on%20my%20machine-yellow)
 
@@ -22,12 +22,16 @@ vimium-like click hints for wayland. press a keybind, get letter labels on every
 - gtk4
 - gtk4-layer-shell
 - at-spi2 (libatspi)
-- hyprctl (hyprland)
 - pkg-config
 
 on fedora:
 ```
 sudo dnf install gtk4-devel gtk4-layer-shell-devel at-spi2-core-devel
+```
+
+on gentoo:
+```
+emerge gui-libs/gtk gui-libs/gtk4-layer-shell app-accessibility/at-spi2-core
 ```
 
 ## build
@@ -60,11 +64,10 @@ or set the flatpak env if you're using flatpak chromium:
 flatpak override --user --env=ACCESSIBILITY_ENABLED=1 io.github.nickvision.chromium
 ```
 
-**hyprland keybinds** — add to your hyprland config:
-```
-bind = $mainMod, semicolon, exec, /path/to/wlim
-bind = $mainMod SHIFT, semicolon, exec, /path/to/wlim --scroll
-
+**compositor keybind** — bind wlim to a key in your compositor config. for example in dwl's `config.h`:
+```c
+{ MODKEY, XKB_KEY_semicolon, spawn, {.v = (const char*[]){ "/path/to/wlim", NULL }} },
+{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_semicolon, spawn, {.v = (const char*[]){ "/path/to/wlim", "--scroll", NULL }} },
 ```
 
 ## config
@@ -104,16 +107,17 @@ jump_speed=200
 
 ## known issues / caveats
 
-- **GTK4 apps on wayland** report (0,0) for all widget positions via AT-SPI. wlim detects this and falls back to distributing hints in a grid over the window. not ideal but functional.
+- **GTK4 apps on wayland** report (0,0) for all widget positions via AT-SPI (known upstream bug). these windows are skipped since there's no generic way to query window geometry on wayland.
 - **terminal emulators** (kitty, alacritty, foot, etc) don't expose AT-SPI trees. nothing to hint on.
-- only tested on hyprland. should work on other wlroots compositors that support gtk4-layer-shell but idk.
+- **chromium/electron** coords may be window-relative on some compositors — hints might land at wrong positions if the window isn't at (0,0).
 
 ## how the sausage is made
 
 the hard parts were:
-- GTK4 on wayland won't give you real widget coordinates through AT-SPI (known upstream bug). had to detect broken coords and fall back to a grid layout using window geometry from `hyprctl`.
+- GTK4 on wayland won't give you real widget coordinates through AT-SPI (known upstream bug). these windows are detected and skipped.
 - the overlay window has to use `rgba(0,0,0,0.01)` background instead of fully transparent, because wayland compositors drop pointer events on fully transparent surfaces.
 - the click has to happen *after* the overlay is fully unmapped by the compositor, otherwise it hits the overlay instead of the target. there's a 150ms sleep for this.
+- screen bounds for uinput are read from GDK's monitor API — no compositor-specific IPC needed.
 
 ## license
 
