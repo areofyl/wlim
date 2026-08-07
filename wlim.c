@@ -205,13 +205,13 @@ static void walk(AtspiAccessible *node, Target *out, int *n, int depth) {
     AtspiRole role = atspi_accessible_get_role(node, &err);
     if (err) { g_error_free(err); goto kids; }
 
+    /* check visibility early — skip entire subtrees that aren't showing */
     if (depth > 0) {
         AtspiStateSet *ss = atspi_accessible_get_state_set(node);
         if (ss) {
-            gboolean ok = atspi_state_set_contains(ss, ATSPI_STATE_VISIBLE)
-                       && atspi_state_set_contains(ss, ATSPI_STATE_SHOWING);
+            gboolean showing = atspi_state_set_contains(ss, ATSPI_STATE_SHOWING);
             g_object_unref(ss);
-            if (!ok) return;
+            if (!showing) return; /* prune entire subtree */
         }
     }
 
@@ -362,11 +362,6 @@ static void collect_all_targets(State *st) {
 
 static int cached_sw = 1920, cached_sh = 1080;
 
-static void get_screen_bounds(int *total_w, int *total_h) {
-    *total_w = cached_sw;
-    *total_h = cached_sh;
-}
-
 static void emit(int fd, int type, int code, int val) {
     struct input_event ev = {0};
     ev.type = type;
@@ -375,19 +370,17 @@ static void emit(int fd, int type, int code, int val) {
     write(fd, &ev, sizeof(ev));
 }
 
-static void do_click(int x, int y, int button) {
-    int sw, sh;
-    get_screen_bounds(&sw, &sh);
+/* pre-created uinput device fd — created once at startup so
+ * the compositor has already registered it by click time */
+static int click_uinput_fd = -1;
 
+static void click_uinput_create(int sw, int sh) {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (fd < 0) {
         fprintf(stderr, "[wlim] cannot open /dev/uinput: %s\n", strerror(errno));
         return;
     }
 
-    /* enable event types — use REL pointer so wlroots treats this as a
-     * regular mouse (ABS-only devices are handled as tablets and don't
-     * trigger wl_pointer.enter on surfaces) */
     ioctl(fd, UI_SET_EVBIT, EV_REL);
     ioctl(fd, UI_SET_EVBIT, EV_ABS);
     ioctl(fd, UI_SET_EVBIT, EV_KEY);
@@ -400,7 +393,6 @@ static void do_click(int x, int y, int button) {
     ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT);
     ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE);
 
-    /* configure abs axes to match screen pixel dimensions */
     struct uinput_abs_setup abs_x = {0};
     abs_x.code = ABS_X;
     abs_x.absinfo.minimum = 0;
@@ -413,7 +405,6 @@ static void do_click(int x, int y, int button) {
     abs_y.absinfo.maximum = sh - 1;
     ioctl(fd, UI_ABS_SETUP, &abs_y);
 
-    /* create the device */
     struct uinput_setup setup = {0};
     snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "wlim-pointer");
     setup.id.bustype = BUS_VIRTUAL;
@@ -422,48 +413,52 @@ static void do_click(int x, int y, int button) {
     setup.id.version = 1;
     ioctl(fd, UI_DEV_SETUP, &setup);
     ioctl(fd, UI_DEV_CREATE);
+    click_uinput_fd = fd;
+}
 
-    /* delay for compositor to register the new device */
-    usleep(100000);
+static void click_uinput_destroy(void) {
+    if (click_uinput_fd >= 0) {
+        ioctl(click_uinput_fd, UI_DEV_DESTROY);
+        close(click_uinput_fd);
+        click_uinput_fd = -1;
+    }
+}
 
-    /* clamp coordinates */
+static void do_click(int x, int y, int button) {
+    int fd = click_uinput_fd;
+    if (fd < 0) {
+        fprintf(stderr, "[wlim] no uinput device\n");
+        return;
+    }
+
     if (x < 0) x = 0;
     if (y < 0) y = 0;
-    if (x >= sw) x = sw - 1;
-    if (y >= sh) y = sh - 1;
+    if (x >= cached_sw) x = cached_sw - 1;
+    if (y >= cached_sh) y = cached_sh - 1;
 
     const char *bname = button == BTN_RIGHT ? "right" : button == BTN_MIDDLE ? "middle" : "left";
-    fprintf(stderr, "[wlim] %s-clicking at (%d,%d) screen=(%dx%d)\n", bname, x, y, sw, sh);
+    fprintf(stderr, "[wlim] %s-clicking at (%d,%d) screen=(%dx%d)\n", bname, x, y, cached_sw, cached_sh);
 
     /* move cursor to position */
     emit(fd, EV_ABS, ABS_X, x);
     emit(fd, EV_ABS, ABS_Y, y);
     emit(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(50000);
+    usleep(16000); /* one frame at 60Hz */
 
-    /* nudge with relative motion to trigger wl_pointer.enter on the surface */
+    /* nudge to trigger wl_pointer.enter */
     emit(fd, EV_REL, REL_X, 1);
-    emit(fd, EV_REL, REL_Y, 0);
     emit(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(30000);
+    usleep(8000);
     emit(fd, EV_REL, REL_X, -1);
-    emit(fd, EV_REL, REL_Y, 0);
     emit(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(50000);
+    usleep(16000);
 
-    /* press */
+    /* click */
     emit(fd, EV_KEY, button, 1);
     emit(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(20000);
-
-    /* release */
+    usleep(8000);
     emit(fd, EV_KEY, button, 0);
     emit(fd, EV_SYN, SYN_REPORT, 0);
-    usleep(20000);
-
-    /* destroy */
-    ioctl(fd, UI_DEV_DESTROY);
-    close(fd);
 }
 
 /* ------------------------------------------------------------------ */
@@ -920,7 +915,8 @@ static void on_activate(GtkApplication *app, gpointer data) {
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), search_box);
     s->search_box = search_box;
 
-    /* cache screen bounds for uinput click coordinates */
+    /* cache screen bounds and pre-create uinput device so
+     * the compositor registers it while the user types hints */
     {
         GdkDisplay *disp = gdk_display_get_default();
         if (disp) {
@@ -938,6 +934,7 @@ static void on_activate(GtkApplication *app, gpointer data) {
             if (max_x > 0) cached_sw = max_x;
             if (max_y > 0) cached_sh = max_y;
         }
+        click_uinput_create(cached_sw, cached_sh);
     }
 
     GtkEventController *kc = gtk_event_controller_key_new();
@@ -987,8 +984,9 @@ int main(int argc, char *argv[]) {
 
     /* click after GTK is fully torn down so the overlay is gone */
     if (st.should_click) {
-        usleep(200000);
+        usleep(50000); /* 50ms — overlay is already unmapped at this point */
         do_click(st.click_x, st.click_y, st.click_button);
     }
+    click_uinput_destroy();
     return 0;
 }
