@@ -142,7 +142,6 @@ typedef struct {
     int cx, cy;       /* click position (center of element) */
     char label[MAX_LABEL + 1];
     char name[128];   /* element text from AT-SPI */
-    AtspiAccessible *node;  /* kept alive for do_action */
 } Target;
 
 typedef struct {
@@ -157,7 +156,6 @@ typedef struct {
     int     click_x, click_y;
     int     click_button;  /* BTN_LEFT, BTN_RIGHT, or BTN_MIDDLE */
     gboolean should_click;
-    AtspiAccessible *click_node;  /* for AT-SPI direct action */
     gboolean search_mode;
     char    search[64];
     int     search_len;
@@ -246,7 +244,6 @@ static void walk(AtspiAccessible *node, Target *out, int *n, int depth) {
                     } else {
                         t->name[0] = '\0';
                     }
-                    t->node = g_object_ref(node);
                     (*n)++;
                 }
             }
@@ -415,29 +412,6 @@ static void click_uinput_destroy(void) {
         close(click_uinput_fd);
         click_uinput_fd = -1;
     }
-}
-
-static gboolean do_atspi_action(AtspiAccessible *node) {
-    AtspiAction *action = atspi_accessible_get_action_iface(node);
-    if (action) {
-        int n = atspi_action_get_n_actions(action, NULL);
-        if (n > 0) {
-            gboolean ok = atspi_action_do_action(action, 0, NULL);
-            fprintf(stderr, "[wlim] atspi do_action(0) -> %s\n", ok ? "ok" : "fail");
-            g_object_unref(action);
-            return ok;
-        }
-        g_object_unref(action);
-    }
-    /* fallback: try grabbing focus */
-    AtspiComponent *comp = atspi_accessible_get_component_iface(node);
-    if (comp) {
-        gboolean ok = atspi_component_grab_focus(comp, NULL);
-        fprintf(stderr, "[wlim] atspi grab_focus -> %s\n", ok ? "ok" : "fail");
-        g_object_unref(comp);
-        return ok;
-    }
-    return FALSE;
 }
 
 static void do_click(int x, int y, int button) {
@@ -848,7 +822,6 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         s->click_button = (mod & GDK_SHIFT_MASK) ? BTN_RIGHT
                         : (mod & GDK_CONTROL_MASK) ? BTN_MIDDLE
                         : BTN_LEFT;
-        s->click_node = s->targets[mi].node;
         gtk_window_destroy(GTK_WINDOW(s->win));
         return TRUE;
     }
@@ -1157,9 +1130,6 @@ int main(int argc, char *argv[]) {
         usleep(50000);
         do_click(st.click_x, st.click_y, st.click_button);
     }
-    /* clean up AT-SPI refs */
-    for (int i = 0; i < st.n_targets; i++)
-        if (st.targets[i].node) g_object_unref(st.targets[i].node);
     click_uinput_destroy();
     return 0;
 }
