@@ -139,6 +139,7 @@ typedef struct {
     int cx, cy;       /* click position (center of element) */
     char label[MAX_LABEL + 1];
     char name[128];   /* element text from AT-SPI */
+    AtspiAccessible *node;  /* kept alive for do_action */
 } Target;
 
 typedef struct {
@@ -153,10 +154,17 @@ typedef struct {
     int     click_x, click_y;
     int     click_button;  /* BTN_LEFT, BTN_RIGHT, or BTN_MIDDLE */
     gboolean should_click;
+    AtspiAccessible *click_node;  /* for AT-SPI direct action */
     gboolean search_mode;
     char    search[64];
     int     search_len;
     GtkWidget *search_box;
+    int     mon_x, mon_y, mon_w, mon_h;  /* target monitor bounds */
+    int     scale;                         /* GDK scale factor */
+    int     n_monitors;
+    GtkWidget *extra_wins[8];  /* overlay windows on other monitors */
+    int     atspi_win_w, atspi_win_h;      /* AT-SPI window size (for offset calc) */
+    int     atspi_off_x, atspi_off_y;      /* detected window offset */
 } State;
 
 
@@ -198,6 +206,7 @@ static gboolean is_duplicate(Target *out, int n, int x, int y) {
     return FALSE;
 }
 
+
 static void walk(AtspiAccessible *node, Target *out, int *n, int depth) {
     if (!node || depth > 30 || *n >= MAX_TARGETS) return;
 
@@ -234,6 +243,7 @@ static void walk(AtspiAccessible *node, Target *out, int *n, int depth) {
                     } else {
                         t->name[0] = '\0';
                     }
+                    t->node = g_object_ref(node);
                     (*n)++;
                 }
             }
@@ -251,23 +261,25 @@ kids:;
     }
 }
 
-/* read focused window geometry exported by dwl */
-static gboolean read_active_geom(int *wx, int *wy, int *ww, int *wh) {
-    FILE *f = fopen("/tmp/dwl-active-geom", "r");
-    if (!f) return FALSE;
-    int ok = fscanf(f, "%d %d %d %d", wx, wy, ww, wh) == 4;
-    fclose(f);
-    return ok;
+/* filter targets to only those whose click point falls within the given rect */
+static void filter_targets_to_rect(State *st, int rx, int ry, int rw, int rh) {
+    int out = 0;
+    for (int i = 0; i < st->n_targets; i++) {
+        int cx = st->targets[i].cx;
+        int cy = st->targets[i].cy;
+        if (cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh) {
+            if (out != i) st->targets[out] = st->targets[i];
+            out++;
+        }
+    }
+    fprintf(stderr, "[wlim] filtered %d -> %d targets for monitor (%d,%d %dx%d)\n",
+            st->n_targets, out, rx, ry, rw, rh);
+    st->n_targets = out;
 }
 
 /* walk all AT-SPI apps/windows, collecting targets from every one.
- * uses dwl's exported geometry to fix window-relative coords. */
+ * uses AT-SPI window extents to detect and fix window-relative coords. */
 static void collect_all_targets(State *st) {
-    int wx = 0, wy = 0, ww = 0, wh = 0;
-    gboolean have_geom = read_active_geom(&wx, &wy, &ww, &wh);
-    if (have_geom)
-        fprintf(stderr, "[wlim] dwl active window: (%d,%d %dx%d)\n", wx, wy, ww, wh);
-
     AtspiAccessible *desktop = atspi_get_desktop(0);
     int napps = atspi_accessible_get_child_count(desktop, NULL);
 
@@ -294,58 +306,35 @@ static void collect_all_targets(State *st) {
                     if (st->targets[t].x == 0 && st->targets[t].y == 0) zeros++;
 
                 if ((double)zeros / count >= 0.8) {
-                    /* broken coords — use dwl geometry for grid fallback */
-                    if (have_geom && ww > 0 && wh > 0) {
-                        int m = 30;
-                        int gx = wx + m, gy = wy + m;
-                        int gw = ww - m*2, gh = wh - m*2;
-                        int cols = (int)ceil(sqrt((double)count));
-                        int rows = (int)ceil((double)count / cols);
-                        double cw = (double)gw / (cols ? cols : 1);
-                        double ch = (double)gh / (rows ? rows : 1);
-                        for (int t = 0; t < count; t++) {
-                            int px = (int)(gx + (t % cols) * cw + cw / 2);
-                            int py = (int)(gy + (t / cols) * ch + ch / 2);
-                            st->targets[start + t].lx = px;
-                            st->targets[start + t].ly = py;
-                            st->targets[start + t].cx = px;
-                            st->targets[start + t].cy = py;
-                        }
-                        fprintf(stderr, "[wlim] window \"%s\": %d targets, grid fallback over (%d,%d %dx%d)\n",
-                                dbg_name ? dbg_name : "?", count, wx, wy, ww, wh);
-                    } else {
-                        fprintf(stderr, "[wlim] window \"%s\": %d targets with broken coords, skipping\n",
-                                dbg_name ? dbg_name : "?", count);
-                        st->n_targets = start;
-                    }
+                    fprintf(stderr, "[wlim] window \"%s\": %d targets with broken coords, skipping\n",
+                            dbg_name ? dbg_name : "?", count);
+                    st->n_targets = start;
                 } else {
-                    /* detect window-relative coords: if most elements fit
-                     * inside [0,ww)x[0,wh) and the window isn't at (0,0),
-                     * apply the window position as offset */
                     int off_x = 0, off_y = 0;
-                    if (have_geom && ww > 0 && wh > 0 && (wx > 0 || wy > 0)) {
-                        int window_rel = 0;
-                        for (int t = start; t < st->n_targets; t++) {
-                            Target *tg = &st->targets[t];
-                            if (tg->x >= 0 && tg->x < ww &&
-                                tg->y >= 0 && tg->y < wh)
-                                window_rel++;
+                    /* store AT-SPI window size for pointer-based offset detection */
+                    AtspiComponent *wcomp = atspi_accessible_get_component_iface(w);
+                    if (wcomp) {
+                        AtspiRect *wext = atspi_component_get_extents(
+                            wcomp, ATSPI_COORD_TYPE_SCREEN, NULL);
+                        if (wext) {
+                            st->atspi_win_w = wext->width;
+                            st->atspi_win_h = wext->height;
+                            off_x = wext->x;
+                            off_y = wext->y;
+                            fprintf(stderr, "[wlim] window \"%s\": %d targets, "
+                                    "win=(%d,%d %dx%d)\n",
+                                    dbg_name ? dbg_name : "?", count,
+                                    wext->x, wext->y, wext->width, wext->height);
+                            g_free(wext);
                         }
-                        if ((double)window_rel / count >= 0.8) {
-                            off_x = wx;
-                            off_y = wy;
-                        }
+                        g_object_unref(wcomp);
                     }
 
-                    fprintf(stderr, "[wlim] window \"%s\": %d targets, offset=(%d,%d)\n",
-                            dbg_name ? dbg_name : "?", count, off_x, off_y);
-
+                    /* apply offset to get screen-absolute click positions */
                     for (int t = start; t < st->n_targets; t++) {
                         Target *tg = &st->targets[t];
                         tg->cx = tg->x + off_x + tg->w / 2;
                         tg->cy = tg->y + off_y + tg->h / 2;
-                        tg->lx = tg->x + off_x + 16;
-                        tg->ly = tg->y + off_y + 8;
                     }
                 }
                 if (dbg_name) g_free(dbg_name);
@@ -367,7 +356,8 @@ static void emit(int fd, int type, int code, int val) {
     ev.type = type;
     ev.code = code;
     ev.value = val;
-    write(fd, &ev, sizeof(ev));
+    if (write(fd, &ev, sizeof(ev)) < 0)
+        fprintf(stderr, "[wlim] write failed: %s\n", strerror(errno));
 }
 
 /* pre-created uinput device fd — created once at startup so
@@ -422,6 +412,29 @@ static void click_uinput_destroy(void) {
         close(click_uinput_fd);
         click_uinput_fd = -1;
     }
+}
+
+static gboolean do_atspi_action(AtspiAccessible *node) {
+    AtspiAction *action = atspi_accessible_get_action_iface(node);
+    if (action) {
+        int n = atspi_action_get_n_actions(action, NULL);
+        if (n > 0) {
+            gboolean ok = atspi_action_do_action(action, 0, NULL);
+            fprintf(stderr, "[wlim] atspi do_action(0) -> %s\n", ok ? "ok" : "fail");
+            g_object_unref(action);
+            return ok;
+        }
+        g_object_unref(action);
+    }
+    /* fallback: try grabbing focus */
+    AtspiComponent *comp = atspi_accessible_get_component_iface(node);
+    if (comp) {
+        gboolean ok = atspi_component_grab_focus(comp, NULL);
+        fprintf(stderr, "[wlim] atspi grab_focus -> %s\n", ok ? "ok" : "fail");
+        g_object_unref(comp);
+        return ok;
+    }
+    return FALSE;
 }
 
 static void do_click(int x, int y, int button) {
@@ -494,7 +507,7 @@ static int find_keyboard(void) {
     while ((ent = readdir(d)) != NULL) {
         if (strncmp(ent->d_name, "event", 5) != 0) continue;
 
-        char path[128];
+        char path[280];
         snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
         int fd = open(path, O_RDONLY);
         if (fd < 0) continue;
@@ -569,7 +582,7 @@ static int scroll_main(void) {
     int kbd = find_keyboard();
     if (kbd < 0) {
         fprintf(stderr, "[wlim] no keyboard found\n");
-        system("notify-send -t 3000 wlim 'no keyboard found'");
+        (void)!system("notify-send -t 3000 wlim 'no keyboard found'");
         return 1;
     }
 
@@ -832,6 +845,7 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
         s->click_button = (mod & GDK_SHIFT_MASK) ? BTN_RIGHT
                         : (mod & GDK_CONTROL_MASK) ? BTN_MIDDLE
                         : BTN_LEFT;
+        s->click_node = s->targets[mi].node;
         gtk_window_destroy(GTK_WINDOW(s->win));
         return TRUE;
     }
@@ -842,6 +856,130 @@ static gboolean on_key(GtkEventControllerKey *ctrl, guint keyval,
     if (!any) { s->typed_len = 0; s->typed[0] = '\0'; update_hints(s); }
 
     return TRUE;
+}
+
+static void place_hints(State *s, int off_x, int off_y);
+static void infer_offset(State *s);
+
+/* called from idle after the overlay is mapped and sized.
+ * we now know which monitor the compositor put it on. */
+static gboolean on_layout_done(gpointer data) {
+    State *s = data;
+    int win_w = gtk_widget_get_width(s->win);
+    int win_h = gtk_widget_get_height(s->win);
+
+    /* figure out which monitor we actually landed on by matching size */
+    GdkDisplay *disp = gdk_display_get_default();
+    GListModel *mons = gdk_display_get_monitors(disp);
+    guint nmons = g_list_model_get_n_items(mons);
+    int max_x = 0, max_y = 0;
+
+    s->mon_x = 0; s->mon_y = 0;
+    s->mon_w = win_w; s->mon_h = win_h;
+    s->scale = 1;
+
+    for (guint i = 0; i < nmons; i++) {
+        GdkMonitor *mon = g_list_model_get_item(mons, i);
+        GdkRectangle geo;
+        gdk_monitor_get_geometry(mon, &geo);
+        int sc = gdk_monitor_get_scale_factor(mon);
+        const char *conn = gdk_monitor_get_connector(mon);
+        fprintf(stderr, "[wlim] GDK monitor %d: %s (%d,%d %dx%d) scale=%d\n",
+                i, conn ? conn : "?",
+                geo.x, geo.y, geo.width, geo.height, sc);
+        if (geo.x + geo.width > max_x) max_x = geo.x + geo.width;
+        if (geo.y + geo.height > max_y) max_y = geo.y + geo.height;
+
+        /* match by size — the overlay fills whichever output it's on */
+        if (geo.width == win_w && geo.height == win_h) {
+            s->mon_x = geo.x;
+            s->mon_y = geo.y;
+            s->mon_w = geo.width;
+            s->mon_h = geo.height;
+            s->scale = sc;
+        }
+        g_object_unref(mon);
+    }
+
+    /* uinput needs physical pixel bounds; GDK geometry is logical */
+    int sc = s->scale;
+    if (max_x > 0) cached_sw = max_x * sc;
+    if (max_y > 0) cached_sh = max_y * sc;
+    click_uinput_create(cached_sw, cached_sh);
+
+    fprintf(stderr, "[wlim] overlay mapped at %dx%d -> monitor (%d,%d %dx%d) scale=%d\n",
+            win_w, win_h, s->mon_x, s->mon_y, s->mon_w, s->mon_h, sc);
+
+    /* infer window offset from size difference */
+    if (s->atspi_off_x == 0 && s->atspi_off_y == 0)
+        infer_offset(s);
+
+    place_hints(s, 0, 0);
+    return G_SOURCE_REMOVE;
+}
+
+static void place_hints(State *s, int off_x, int off_y) {
+    int sc = s->scale;
+    /* apply offset to all targets */
+    for (int i = 0; i < s->n_targets; i++) {
+        s->targets[i].cx += off_x;
+        s->targets[i].cy += off_y;
+    }
+
+    /* filter targets to only those on the monitor */
+    filter_targets_to_rect(s, s->mon_x * sc, s->mon_y * sc,
+                           s->mon_w * sc, s->mon_h * sc);
+    generate_labels(s->targets, s->n_targets);
+
+    for (int i = 0; i < s->n_targets; i++) {
+        Target *t = &s->targets[i];
+        t->lx = (t->cx - t->w / 2) / sc - s->mon_x;
+        t->ly = (t->cy - t->h / 2) / sc - s->mon_y;
+
+        if (t->lx < 0) t->lx = 0;
+        if (t->ly < 0) t->ly = 0;
+        if (t->lx > s->mon_w - 20) t->lx = s->mon_w - 20;
+        if (t->ly > s->mon_h - 14) t->ly = s->mon_h - 14;
+
+        if (i < 10)
+            fprintf(stderr, "[wlim] hint '%s' (%s): cx,cy=(%d,%d) placed=(%d,%d)\n",
+                    t->label, t->name, t->cx, t->cy, t->lx, t->ly);
+
+        GtkWidget *lbl = gtk_label_new(t->label);
+        gtk_widget_add_css_class(lbl, "hint-label");
+        gtk_fixed_put(GTK_FIXED(s->fixed), lbl, t->lx, t->ly);
+        s->hint_labels[i] = lbl;
+    }
+    fprintf(stderr, "[wlim] placed %d hints (offset %d,%d)\n", s->n_targets, off_x, off_y);
+}
+
+/* infer window position from AT-SPI window size vs monitor size.
+ * on wayland, apps report (0,0) as their position. but for tiling WMs,
+ * we can figure out the real offset from the gap between window and monitor. */
+static void infer_offset(State *s) {
+    if (s->atspi_win_w <= 0 || s->atspi_win_h <= 0) return;
+    int sc = s->scale;
+    int mw = s->mon_w * sc, mh = s->mon_h * sc;
+    int ww = s->atspi_win_w, wh = s->atspi_win_h;
+
+    /* horizontal: assume symmetric gaps → window centered */
+    int gap_x = (mw - ww) / 2;
+    /* vertical: total missing = bar + gaps. assume bar at top.
+     * gap_y_each = gap_x (same gap size), bar = remaining */
+    int gap_total_y = mh - wh;
+    int off_x = gap_x;
+    int off_y = gap_total_y - gap_x;  /* bar + top gap */
+    if (off_y < 0) off_y = 0;
+
+    fprintf(stderr, "[wlim] inferred offset: (%d,%d) from win=%dx%d mon=%dx%d\n",
+            off_x, off_y, ww, wh, mw, mh);
+
+    for (int i = 0; i < s->n_targets; i++) {
+        s->targets[i].cx += off_x;
+        s->targets[i].cy += off_y;
+    }
+    s->atspi_off_x = off_x;
+    s->atspi_off_y = off_y;
 }
 
 static void on_activate(GtkApplication *app, gpointer data) {
@@ -859,6 +997,37 @@ static void on_activate(GtkApplication *app, gpointer data) {
     gtk_layer_set_anchor(GTK_WINDOW(win), GTK_LAYER_SHELL_EDGE_BOTTOM, TRUE);
     gtk_layer_set_anchor(GTK_WINDOW(win), GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
     gtk_layer_set_anchor(GTK_WINDOW(win), GTK_LAYER_SHELL_EDGE_RIGHT, TRUE);
+
+    /* pick the monitor that contains the most targets */
+    {
+        GdkDisplay *disp = gdk_display_get_default();
+        GListModel *mons = gdk_display_get_monitors(disp);
+        guint nmons = g_list_model_get_n_items(mons);
+        GdkMonitor *best_mon = NULL;
+        int best_count = 0;
+        for (guint i = 0; i < nmons; i++) {
+            GdkMonitor *mon = g_list_model_get_item(mons, i);
+            GdkRectangle geo;
+            gdk_monitor_get_geometry(mon, &geo);
+            int sc = gdk_monitor_get_scale_factor(mon);
+            /* AT-SPI coords are physical, geo is logical — scale geo up */
+            int rx = geo.x * sc, ry = geo.y * sc;
+            int rw = geo.width * sc, rh = geo.height * sc;
+            int count = 0;
+            for (int t = 0; t < s->n_targets; t++) {
+                int cx = s->targets[t].cx, cy = s->targets[t].cy;
+                if (cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh)
+                    count++;
+            }
+            fprintf(stderr, "[wlim] monitor %d has %d targets\n", i, count);
+            if (count > best_count) { best_count = count; best_mon = mon; }
+            else g_object_unref(mon);
+        }
+        if (best_mon) {
+            gtk_layer_set_monitor(GTK_WINDOW(win), best_mon);
+            g_object_unref(best_mon);
+        }
+    }
 
     GtkCssProvider *css = gtk_css_provider_new();
     char cssbuf[1024];
@@ -899,13 +1068,6 @@ static void on_activate(GtkApplication *app, gpointer data) {
     gtk_overlay_set_child(GTK_OVERLAY(overlay), fixed);
     s->fixed = fixed;
 
-    for (int i = 0; i < s->n_targets; i++) {
-        GtkWidget *lbl = gtk_label_new(s->targets[i].label);
-        gtk_widget_add_css_class(lbl, "hint-label");
-        gtk_fixed_put(GTK_FIXED(fixed), lbl, s->targets[i].lx, s->targets[i].ly);
-        s->hint_labels[i] = lbl;
-    }
-
     /* search box — centered at bottom, hidden by default */
     GtkWidget *search_box = gtk_label_new("/ ");
     gtk_widget_add_css_class(search_box, "search-box");
@@ -915,27 +1077,7 @@ static void on_activate(GtkApplication *app, gpointer data) {
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), search_box);
     s->search_box = search_box;
 
-    /* cache screen bounds and pre-create uinput device so
-     * the compositor registers it while the user types hints */
-    {
-        GdkDisplay *disp = gdk_display_get_default();
-        if (disp) {
-            GListModel *mons = gdk_display_get_monitors(disp);
-            guint nmons = g_list_model_get_n_items(mons);
-            int max_x = 0, max_y = 0;
-            for (guint i = 0; i < nmons; i++) {
-                GdkMonitor *mon = g_list_model_get_item(mons, i);
-                GdkRectangle geo;
-                gdk_monitor_get_geometry(mon, &geo);
-                if (geo.x + geo.width > max_x) max_x = geo.x + geo.width;
-                if (geo.y + geo.height > max_y) max_y = geo.y + geo.height;
-                g_object_unref(mon);
-            }
-            if (max_x > 0) cached_sw = max_x;
-            if (max_y > 0) cached_sh = max_y;
-        }
-        click_uinput_create(cached_sw, cached_sh);
-    }
+    g_idle_add(on_layout_done, s);
 
     GtkEventController *kc = gtk_event_controller_key_new();
     g_signal_connect(kc, "key-pressed", G_CALLBACK(on_key), s);
@@ -966,11 +1108,29 @@ int main(int argc, char *argv[]) {
     init_clickable_lut();
     atspi_init();
 
+    /* debug: show what AT-SPI can see */
+    {
+        AtspiAccessible *desktop = atspi_get_desktop(0);
+        int napps = atspi_accessible_get_child_count(desktop, NULL);
+        fprintf(stderr, "[wlim] AT-SPI desktop has %d apps\n", napps);
+        for (int i = 0; i < napps; i++) {
+            AtspiAccessible *app = atspi_accessible_get_child_at_index(desktop, i, NULL);
+            if (!app) continue;
+            gchar *name = atspi_accessible_get_name(app, NULL);
+            int nwins = atspi_accessible_get_child_count(app, NULL);
+            fprintf(stderr, "[wlim]   app %d: \"%s\" (%d windows)\n",
+                    i, name ? name : "?", nwins);
+            if (name) g_free(name);
+            g_object_unref(app);
+        }
+    }
+
     State st = {0};
     collect_all_targets(&st);
+    fprintf(stderr, "[wlim] collected %d targets total\n", st.n_targets);
 
     if (st.n_targets == 0) {
-        system("notify-send -t 3000 wlim 'no clickable elements found'");
+        fprintf(stderr, "[wlim] no clickable elements found\n");
         return 1;
     }
 
@@ -982,11 +1142,20 @@ int main(int argc, char *argv[]) {
     g_application_run(G_APPLICATION(app), 0, NULL);
     g_object_unref(app);
 
-    /* click after GTK is fully torn down so the overlay is gone */
+    /* activate after GTK is fully torn down so the overlay is gone */
     if (st.should_click) {
-        usleep(50000); /* 50ms — overlay is already unmapped at this point */
-        do_click(st.click_x, st.click_y, st.click_button);
+        usleep(50000);
+        /* try AT-SPI action first (no coords needed), fall back to uinput */
+        if (st.click_button == BTN_LEFT && st.click_node &&
+            do_atspi_action(st.click_node)) {
+            /* done */
+        } else {
+            do_click(st.click_x, st.click_y, st.click_button);
+        }
     }
+    /* clean up AT-SPI refs */
+    for (int i = 0; i < st.n_targets; i++)
+        if (st.targets[i].node) g_object_unref(st.targets[i].node);
     click_uinput_destroy();
     return 0;
 }
