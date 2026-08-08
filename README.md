@@ -87,6 +87,9 @@ hint_border_radius=4
 scroll_speed=1
 page_speed=10
 jump_speed=200
+
+# bar position for offset inference (top, bottom, none)
+bar_position=top
 ```
 
 ## scroll mode

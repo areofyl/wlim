@@ -45,6 +45,7 @@ static struct {
     int  scroll_speed;      /* ticks per j/k press */
     int  page_speed;        /* ticks per d/u press */
     int  jump_speed;        /* ticks per G/gg */
+    char bar_position[8];   /* "top", "bottom", or "none" */
 } cfg = {
     .hint_bg           = "#2a2a2a",
     .hint_fg           = "#e0e0e0",
@@ -55,6 +56,7 @@ static struct {
     .scroll_speed      = 1,
     .page_speed        = 10,
     .jump_speed        = 200,
+    .bar_position      = "top",
 };
 
 static void cfg_set(const char *key, const char *val) {
@@ -67,6 +69,7 @@ static void cfg_set(const char *key, const char *val) {
     else if (strcmp(key, "scroll_speed") == 0) cfg.scroll_speed = atoi(val);
     else if (strcmp(key, "page_speed") == 0) cfg.page_speed = atoi(val);
     else if (strcmp(key, "jump_speed") == 0) cfg.jump_speed = atoi(val);
+    else if (strcmp(key, "bar_position") == 0) strncpy(cfg.bar_position, val, sizeof(cfg.bar_position) - 1);
 }
 
 static void cfg_load(void) {
@@ -962,14 +965,21 @@ static void infer_offset(State *s) {
     int mw = s->mon_w * sc, mh = s->mon_h * sc;
     int ww = s->atspi_win_w, wh = s->atspi_win_h;
 
-    /* horizontal: assume symmetric gaps → window centered */
+    /* horizontal: assume symmetric gaps */
     int gap_x = (mw - ww) / 2;
-    /* vertical: total missing = bar + gaps. assume bar at top.
-     * gap_y_each = gap_x (same gap size), bar = remaining */
     int gap_total_y = mh - wh;
     int off_x = gap_x;
-    int off_y = gap_total_y - gap_x;  /* bar + top gap */
-    if (off_y < 0) off_y = 0;
+    int off_y = gap_x;  /* default: just the gap */
+
+    int bar_h = gap_total_y - 2 * gap_x;
+    if (bar_h < 0) bar_h = 0;
+
+    if (strcmp(cfg.bar_position, "top") == 0)
+        off_y = bar_h + gap_x;
+    else if (strcmp(cfg.bar_position, "bottom") == 0)
+        off_y = gap_x;
+    else if (strcmp(cfg.bar_position, "none") == 0)
+        off_y = gap_total_y / 2;
 
     fprintf(stderr, "[wlim] inferred offset: (%d,%d) from win=%dx%d mon=%dx%d\n",
             off_x, off_y, ww, wh, mw, mh);
