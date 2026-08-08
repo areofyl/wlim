@@ -1152,16 +1152,10 @@ int main(int argc, char *argv[]) {
     g_application_run(G_APPLICATION(app), 0, NULL);
     g_object_unref(app);
 
-    /* activate after GTK is fully torn down so the overlay is gone */
+    /* click after GTK is fully torn down so the overlay is gone */
     if (st.should_click) {
         usleep(50000);
-        /* try AT-SPI action first (no coords needed), fall back to uinput */
-        if (st.click_button == BTN_LEFT && st.click_node &&
-            do_atspi_action(st.click_node)) {
-            /* done */
-        } else {
-            do_click(st.click_x, st.click_y, st.click_button);
-        }
+        do_click(st.click_x, st.click_y, st.click_button);
     }
     /* clean up AT-SPI refs */
     for (int i = 0; i < st.n_targets; i++)
